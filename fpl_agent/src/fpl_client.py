@@ -9,7 +9,7 @@ import logging
 import time
 from typing import Any, Optional, Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import IntEnum
 
 import aiohttp
@@ -896,25 +896,47 @@ class FPLClient:
 
     async def get_current_gameweek(self, force_refresh: bool = False) -> Gameweek:
         """
-        Get the current gameweek.
+        Get the current/upcoming gameweek for transfers.
+
+        Returns the next gameweek with an upcoming deadline, not the one
+        marked as 'current' by the API if its deadline has already passed.
 
         Returns:
-            Current Gameweek object.
+            Current or next Gameweek object.
 
         Raises:
             FPLAPIError: If no current gameweek found.
         """
         gameweeks = await self.get_gameweeks(force_refresh)
+        now = datetime.now(timezone.utc)
 
+        # Find the gameweek marked as current
+        current_gw = None
+        next_gw = None
         for gw in gameweeks:
             if gw.is_current:
-                self.logger.info(f"Current gameweek: {gw.id} ({gw.name})")
-                return gw
+                current_gw = gw
+            if gw.is_next:
+                next_gw = gw
+
+        # If current gameweek's deadline has passed or it's finished, use next
+        if current_gw:
+            deadline = current_gw.deadline_time
+            if deadline and deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+
+            if current_gw.finished or (deadline and deadline < now):
+                if next_gw:
+                    self.logger.info(f"GW{current_gw.id} finished/passed, using next: GW{next_gw.id} ({next_gw.name})")
+                    return next_gw
+
+            self.logger.info(f"Current gameweek: {current_gw.id} ({current_gw.name})")
+            return current_gw
 
         # Fall back to next gameweek
-        for gw in gameweeks:
-            if gw.is_next:
-                return gw
+        if next_gw:
+            self.logger.info(f"Using next gameweek: {next_gw.id} ({next_gw.name})")
+            return next_gw
 
         raise FPLAPIError("Could not determine current gameweek")
 
