@@ -1,0 +1,1365 @@
+"""
+Transfer and captain optimization module.
+
+Provides algorithms for selecting optimal transfers and captains using
+greedy optimization with constraint handling.
+"""
+
+import logging
+from typing import Optional
+from dataclasses import dataclass, field
+from enum import IntEnum
+from itertools import combinations
+
+import pandas as pd
+import numpy as np
+
+from .config import Config
+from .fpl_client import FPLClient, Player
+from .data_collector import DataCollector
+
+
+# =============================================================================
+# Constants and Enums
+# =============================================================================
+
+class Position(IntEnum):
+    """Player positions."""
+    GOALKEEPER = 1
+    DEFENDER = 2
+    MIDFIELDER = 3
+    FORWARD = 4
+
+
+POSITION_NAMES = {
+    Position.GOALKEEPER: "GK",
+    Position.DEFENDER: "DEF",
+    Position.MIDFIELDER: "MID",
+    Position.FORWARD: "FWD",
+}
+
+
+# Valid formations for starting XI
+VALID_FORMATIONS = [
+    (1, 3, 5, 2),  # 3-5-2
+    (1, 3, 4, 3),  # 3-4-3
+    (1, 4, 5, 1),  # 4-5-1
+    (1, 4, 4, 2),  # 4-4-2
+    (1, 4, 3, 3),  # 4-3-3
+    (1, 5, 4, 1),  # 5-4-1
+    (1, 5, 3, 2),  # 5-3-2
+    (1, 5, 2, 3),  # 5-2-3
+]
+
+
+# =============================================================================
+# Data Classes
+# =============================================================================
+
+@dataclass
+class TransferRecommendation:
+    """Represents a recommended transfer."""
+    player_out: Player
+    player_in: Player
+    expected_gain: float
+    reason: str
+    priority: int = 1  # 1 = highest priority
+    hit_cost: int = 0  # Transfer hit cost (-4 per extra transfer)
+    net_gain: float = 0.0  # expected_gain - hit_cost
+
+    def __post_init__(self):
+        self.net_gain = self.expected_gain - abs(self.hit_cost)
+
+    def __str__(self) -> str:
+        hit_str = f" (HIT: {self.hit_cost})" if self.hit_cost < 0 else ""
+        return (
+            f"OUT: {self.player_out.web_name} ({self.player_out.now_cost:.1f}m) -> "
+            f"IN: {self.player_in.web_name} ({self.player_in.now_cost:.1f}m){hit_str} | "
+            f"Net gain: {self.net_gain:.2f} pts | {self.reason}"
+        )
+
+
+@dataclass
+class CaptainRecommendation:
+    """Represents a captain recommendation."""
+    player: Player
+    expected_points: float
+    fixture_score: float
+    confidence: float  # 0-1 scale
+    is_home: bool
+    ownership: float
+    reason: str
+    is_differential: bool = False  # True if < 10% ownership
+
+    def __post_init__(self):
+        self.is_differential = self.ownership < 10.0
+
+    def __str__(self) -> str:
+        venue = "(H)" if self.is_home else "(A)"
+        diff_str = " [DIFF]" if self.is_differential else ""
+        return (
+            f"{self.player.web_name} {venue}{diff_str} | "
+            f"Expected: {self.expected_points:.2f} pts | "
+            f"Confidence: {self.confidence:.0%} | {self.reason}"
+        )
+
+
+@dataclass
+class ChipRecommendation:
+    """Represents a chip usage recommendation."""
+    chip_name: str  # wildcard, bench_boost, free_hit, triple_captain
+    gameweek: int
+    score: float  # 0-100 scale
+    reasons: list[str] = field(default_factory=list)
+    is_recommended: bool = False
+
+    def __str__(self) -> str:
+        status = "RECOMMENDED" if self.is_recommended else "Consider"
+        return f"{self.chip_name.upper()} GW{self.gameweek}: {status} (Score: {self.score:.0f}/100)"
+
+
+@dataclass
+class OptimizationResult:
+    """Results of the optimization process."""
+    transfers: list[TransferRecommendation] = field(default_factory=list)
+    captain: Optional[CaptainRecommendation] = None
+    vice_captain: Optional[CaptainRecommendation] = None
+    differential_captain: Optional[CaptainRecommendation] = None
+    chip_recommendations: list[ChipRecommendation] = field(default_factory=list)
+    total_expected_gain: float = 0.0
+    total_hit_cost: int = 0
+    net_expected_gain: float = 0.0
+    warnings: list[str] = field(default_factory=list)
+
+
+# =============================================================================
+# Transfer Optimizer
+# =============================================================================
+
+class TransferOptimizer:
+    """
+    Optimizes transfers using greedy algorithm with constraint handling.
+
+    Considers:
+    - Free transfers available
+    - Hit penalties (-4 per extra transfer)
+    - Team composition limits (max 3 per team)
+    - Formation validity
+    - Budget constraints
+    - Multi-week projected points
+    """
+
+    HIT_PENALTY = -4
+    MAX_FROM_TEAM = 3
+    MIN_IMPROVEMENT_THRESHOLD = 2.0  # Minimum improvement to suggest transfer
+
+    def __init__(
+        self,
+        current_squad: list[Player],
+        player_df: pd.DataFrame,
+        budget: float,
+        free_transfers: int,
+        max_transfers: int = 2,
+        planning_horizon: int = 5,
+    ):
+        """
+        Initialize transfer optimizer.
+
+        Args:
+            current_squad: Current squad players.
+            player_df: DataFrame with all player data and projections.
+            budget: Available budget in millions.
+            free_transfers: Number of free transfers available.
+            max_transfers: Maximum transfers to recommend.
+            planning_horizon: Number of gameweeks to consider.
+        """
+        self.current_squad = current_squad
+        self.player_df = player_df
+        self.budget = budget
+        self.free_transfers = free_transfers
+        self.max_transfers = max_transfers
+        self.planning_horizon = planning_horizon
+        self.logger = logging.getLogger("fpl_agent.optimizer.transfer")
+
+        # Build lookup structures
+        self.squad_ids = {p.id for p in current_squad}
+        self.team_counts = self._count_teams()
+        self.position_counts = self._count_positions()
+
+    def _count_teams(self) -> dict[int, int]:
+        """Count players per team in current squad."""
+        counts = {}
+        for player in self.current_squad:
+            counts[player.team] = counts.get(player.team, 0) + 1
+        return counts
+
+    def _count_positions(self) -> dict[int, int]:
+        """Count players per position in current squad."""
+        counts = {}
+        for player in self.current_squad:
+            counts[player.element_type] = counts.get(player.element_type, 0) + 1
+        return counts
+
+    def optimize(self) -> list[TransferRecommendation]:
+        """
+        Find optimal transfers using greedy algorithm.
+
+        Returns:
+            List of TransferRecommendation objects sorted by net gain.
+        """
+        self.logger.info(
+            f"Optimizing transfers: budget={self.budget:.1f}m, "
+            f"free_transfers={self.free_transfers}, max={self.max_transfers}"
+        )
+
+        all_recommendations = []
+
+        # Evaluate each player in squad for potential replacement
+        for player_out in self.current_squad:
+            candidates = self._find_replacement_candidates(player_out)
+
+            if candidates.empty:
+                continue
+
+            # Score and rank candidates
+            candidates = self._score_candidates(candidates, player_out)
+
+            # Get best candidate
+            if not candidates.empty:
+                best = candidates.iloc[0]
+                gain = best["improvement"]
+
+                if gain > self.MIN_IMPROVEMENT_THRESHOLD:
+                    recommendation = self._create_recommendation(player_out, best)
+                    all_recommendations.append(recommendation)
+
+        # Sort by priority and net gain
+        all_recommendations.sort(key=lambda x: (x.priority, -x.net_gain))
+
+        # Apply transfer limits and hit penalties
+        final_recommendations = self._apply_transfer_limits(all_recommendations)
+
+        return final_recommendations
+
+    def _find_replacement_candidates(self, player_out: Player) -> pd.DataFrame:
+        """Find valid replacement candidates for a player."""
+        position = player_out.element_type
+        max_price = player_out.now_cost + self.budget
+
+        # Base filters
+        candidates = self.player_df[
+            (self.player_df["position_id"] == position) &
+            (self.player_df["price"] <= max_price) &
+            (~self.player_df["player_id"].isin(self.squad_ids)) &
+            (self.player_df["availability"] >= 0.75) &
+            (self.player_df["minutes"] > 0)
+        ].copy()
+
+        # Filter by team limits
+        valid_mask = candidates["team_id"].apply(
+            lambda t: self._can_add_from_team(t, player_out.team)
+        )
+        candidates = candidates[valid_mask]
+
+        return candidates
+
+    def _can_add_from_team(self, new_team: int, replacing_team: int) -> bool:
+        """Check if adding player from team would violate limits."""
+        current_count = self.team_counts.get(new_team, 0)
+        # If replacing someone from same team, don't count them
+        if new_team == replacing_team:
+            current_count -= 1
+        return current_count < self.MAX_FROM_TEAM
+
+    def _score_candidates(self, candidates: pd.DataFrame, player_out: Player) -> pd.DataFrame:
+        """Score candidates based on expected improvement."""
+        out_score = self._calculate_player_score(player_out)
+
+        candidates["score"] = candidates.apply(
+            lambda row: self._calculate_row_score(row),
+            axis=1
+        )
+        candidates["improvement"] = candidates["score"] - out_score
+        candidates["price_diff"] = candidates["price"] - player_out.now_cost
+
+        return candidates.sort_values("improvement", ascending=False)
+
+    def _calculate_player_score(self, player: Player) -> float:
+        """Calculate score for a player from Player object."""
+        row = self.player_df[self.player_df["player_id"] == player.id]
+        if row.empty:
+            return 0.0
+        return self._calculate_row_score(row.iloc[0])
+
+    def _calculate_row_score(self, row: pd.Series) -> float:
+        """Calculate weighted score for player data row."""
+        score = 0.0
+
+        # Form (recent performance)
+        score += float(row.get("form", 0)) * 2.0
+
+        # Fixture difficulty (inverted - lower is better)
+        fixture = float(row.get("fixture_difficulty", 3.0))
+        score += (5 - fixture) * 3.0
+
+        # xGI (expected goal involvement)
+        score += float(row.get("xGI", 0)) * 2.5
+
+        # Projected points (weighted sum over horizon)
+        for i in range(1, min(6, self.planning_horizon + 1)):
+            col = f"gw{i}_projected"
+            if col in row:
+                weight = 1.0 / i  # Decay for future gameweeks
+                score += float(row.get(col, 0) or 0) * weight * 2.0
+
+        # Value score (points per million)
+        score += float(row.get("value", 0)) * 1.0
+
+        # Availability penalty
+        availability = float(row.get("availability", 1.0))
+        score *= availability
+
+        return score
+
+    def _create_recommendation(
+        self, player_out: Player, candidate: pd.Series
+    ) -> TransferRecommendation:
+        """Create transfer recommendation from candidate data."""
+        # Find Player object for candidate
+        player_in = Player(
+            id=int(candidate["player_id"]),
+            web_name=str(candidate["name"]),
+            first_name=str(candidate.get("full_name", candidate["name"])).split()[0] if candidate.get("full_name") else str(candidate["name"]),
+            second_name=str(candidate.get("full_name", candidate["name"])).split()[-1] if candidate.get("full_name") else str(candidate["name"]),
+            team=int(candidate["team_id"]),
+            team_name=str(candidate.get("team_name", f"Team{candidate['team_id']}")),
+            element_type=int(candidate["position_id"]),
+            now_cost=float(candidate["price"]),
+            total_points=int(candidate.get("total_points", 0)),
+            form=float(candidate.get("form", 0)),
+            points_per_game=float(candidate.get("points_per_game", 0)),
+            selected_by_percent=float(candidate.get("selected_by", 0)),
+            minutes=int(candidate.get("minutes", 0)),
+            goals_scored=int(candidate.get("goals", 0)),
+            assists=int(candidate.get("assists", 0)),
+            clean_sheets=int(candidate.get("clean_sheets", 0)),
+            goals_conceded=int(candidate.get("goals_conceded", 0)),
+            bonus=int(candidate.get("bonus", 0)),
+            bps=int(candidate.get("bps", 0)),
+            expected_goals=float(candidate.get("xG", 0)),
+            expected_assists=float(candidate.get("xA", 0)),
+            expected_goal_involvements=float(candidate.get("xGI", 0)),
+            expected_goals_conceded=float(candidate.get("xGC", 0)),
+            status=str(candidate.get("status", "a")),
+            news=str(candidate.get("news", "")),
+            news_added=None,
+            chance_of_playing_this_round=None,
+            chance_of_playing_next_round=int(candidate["chance_of_playing"]) if pd.notna(candidate.get("chance_of_playing")) else None,
+            transfers_in_event=int(candidate.get("transfers_in", 0) or 0),
+            transfers_out_event=int(candidate.get("transfers_out", 0) or 0),
+            cost_change_event=int((candidate.get("price_change", 0) or 0) * 10),
+            cost_change_start=0,
+        )
+
+        # Determine priority and reason
+        out_availability = self.player_df[
+            self.player_df["player_id"] == player_out.id
+        ].iloc[0].get("availability", 1.0) if not self.player_df[
+            self.player_df["player_id"] == player_out.id
+        ].empty else 1.0
+
+        if out_availability < 0.5:
+            priority = 1
+            reason = f"{player_out.web_name} injured/unavailable"
+        elif out_availability < 0.75:
+            priority = 2
+            reason = f"{player_out.web_name} doubtful"
+        elif candidate["improvement"] > 5.0:
+            priority = 2
+            reason = f"Significant upgrade ({candidate['improvement']:.1f} pts)"
+        else:
+            priority = 3
+            reason = self._generate_reason(player_out, candidate)
+
+        return TransferRecommendation(
+            player_out=player_out,
+            player_in=player_in,
+            expected_gain=candidate["improvement"],
+            reason=reason,
+            priority=priority,
+            hit_cost=0,  # Will be set by _apply_transfer_limits
+        )
+
+    def _generate_reason(self, player_out: Player, candidate: pd.Series) -> str:
+        """Generate human-readable reason for transfer."""
+        reasons = []
+
+        # Form comparison
+        if candidate["form"] > player_out.form + 1.5:
+            reasons.append(f"Better form ({candidate['form']:.1f} vs {player_out.form:.1f})")
+
+        # Fixture comparison
+        fixture_diff = candidate.get("fixture_difficulty", 3.0)
+        if fixture_diff <= 2.5:
+            reasons.append("Favorable fixtures")
+
+        # Price difference
+        price_diff = candidate["price"] - player_out.now_cost
+        if price_diff < -0.5:
+            reasons.append(f"Saves {abs(price_diff):.1f}m")
+        elif price_diff > 0.5:
+            reasons.append(f"Premium upgrade (+{price_diff:.1f}m)")
+
+        # xGI comparison
+        if candidate.get("xGI", 0) > player_out.expected_goal_involvements + 0.3:
+            reasons.append(f"Higher xGI ({candidate['xGI']:.2f})")
+
+        if not reasons:
+            reasons.append(f"Expected improvement of {candidate['improvement']:.1f} pts")
+
+        return "; ".join(reasons[:2])
+
+    def _apply_transfer_limits(
+        self, recommendations: list[TransferRecommendation]
+    ) -> list[TransferRecommendation]:
+        """Apply transfer limits and calculate hit costs."""
+        final = []
+        transfers_used = 0
+
+        for rec in recommendations:
+            if transfers_used >= self.max_transfers:
+                break
+
+            # Calculate hit cost
+            if transfers_used < self.free_transfers:
+                rec.hit_cost = 0
+            else:
+                rec.hit_cost = self.HIT_PENALTY
+
+            rec.net_gain = rec.expected_gain + rec.hit_cost
+
+            # Only include if net gain is positive
+            if rec.net_gain > 0:
+                final.append(rec)
+                transfers_used += 1
+
+        return final
+
+
+# =============================================================================
+# Captain Selector
+# =============================================================================
+
+class CaptainSelector:
+    """
+    Selects optimal captain and vice-captain.
+
+    Considers:
+    - Home/away fixture
+    - Fixture difficulty rating
+    - Ownership percentage
+    - Form and projected points
+    - Historical captain points
+    """
+
+    def __init__(
+        self,
+        squad: list[Player],
+        player_df: pd.DataFrame,
+        fixtures_df: Optional[pd.DataFrame] = None,
+    ):
+        """
+        Initialize captain selector.
+
+        Args:
+            squad: Current squad (starting XI).
+            player_df: DataFrame with player analysis.
+            fixtures_df: Optional DataFrame with fixture details.
+        """
+        self.squad = squad
+        self.player_df = player_df
+        self.fixtures_df = fixtures_df
+        self.logger = logging.getLogger("fpl_agent.optimizer.captain")
+
+    def select(self) -> list[CaptainRecommendation]:
+        """
+        Rank players for captaincy.
+
+        Returns:
+            Sorted list of CaptainRecommendation objects.
+        """
+        recommendations = []
+
+        for player in self.squad:
+            row = self.player_df[self.player_df["player_id"] == player.id]
+            if row.empty:
+                continue
+
+            row = row.iloc[0]
+
+            # Skip unavailable players
+            availability = float(row.get("availability", 1.0))
+            if availability < 0.75:
+                continue
+
+            # Determine home/away
+            is_home = self._is_home_fixture(row)
+
+            # Get fixture difficulty
+            fixture_score = float(row.get("fixture_difficulty", 3.0))
+
+            # Calculate expected points
+            expected_points = self._calculate_captain_score(player, row, is_home)
+
+            # Calculate confidence
+            confidence = self._calculate_confidence(row, is_home, fixture_score)
+
+            # Get ownership
+            ownership = float(row.get("selected_by", player.selected_by_percent))
+
+            # Generate reason
+            reason = self._generate_captain_reason(player, row, is_home, fixture_score)
+
+            recommendations.append(
+                CaptainRecommendation(
+                    player=player,
+                    expected_points=expected_points,
+                    fixture_score=fixture_score,
+                    confidence=confidence,
+                    is_home=is_home,
+                    ownership=ownership,
+                    reason=reason,
+                )
+            )
+
+        # Sort by expected points
+        recommendations.sort(key=lambda x: -x.expected_points)
+
+        return recommendations
+
+    def _is_home_fixture(self, row: pd.Series) -> bool:
+        """Determine if player has home fixture."""
+        gw1_fixture = str(row.get("gw1_fixture", ""))
+        return "(H)" in gw1_fixture
+
+    def _calculate_captain_score(
+        self, player: Player, row: pd.Series, is_home: bool
+    ) -> float:
+        """Calculate expected captain score."""
+        base_score = 0.0
+
+        # Projected points (primary factor)
+        projected = float(row.get("gw1_projected", 0) or 0)
+        if projected > 0:
+            base_score += projected * 3.0
+        else:
+            # Fallback to form-based estimation
+            base_score += float(row.get("form", 0)) * 2.0
+
+        # xGI contribution
+        base_score += float(row.get("xGI", 0)) * 2.0
+
+        # Fixture difficulty bonus
+        fixture = float(row.get("fixture_difficulty", 3.0))
+        base_score += (5 - fixture) * 1.5
+
+        # Home advantage
+        if is_home:
+            base_score *= 1.1
+
+        # Premium player bonus
+        if player.now_cost >= 10.0:
+            base_score *= 1.1
+        elif player.now_cost >= 12.0:
+            base_score *= 1.15
+
+        # Form bonus
+        if player.form >= 7.0:
+            base_score *= 1.1
+        elif player.form >= 5.0:
+            base_score *= 1.05
+
+        # Availability penalty
+        availability = float(row.get("availability", 1.0))
+        base_score *= availability
+
+        return base_score
+
+    def _calculate_confidence(
+        self, row: pd.Series, is_home: bool, fixture_score: float
+    ) -> float:
+        """Calculate confidence score (0-1)."""
+        confidence = 0.5  # Base confidence
+
+        # Fixture difficulty factor
+        confidence += (5 - fixture_score) * 0.1
+
+        # Home advantage
+        if is_home:
+            confidence += 0.1
+
+        # Form factor
+        form = float(row.get("form", 0))
+        if form >= 7.0:
+            confidence += 0.15
+        elif form >= 5.0:
+            confidence += 0.1
+        elif form < 3.0:
+            confidence -= 0.15
+
+        # Projected points available
+        projected = float(row.get("gw1_projected", 0) or 0)
+        if projected > 0:
+            confidence += 0.1
+
+        # Availability
+        availability = float(row.get("availability", 1.0))
+        confidence *= availability
+
+        return max(0.0, min(1.0, confidence))
+
+    def _generate_captain_reason(
+        self,
+        player: Player,
+        row: pd.Series,
+        is_home: bool,
+        fixture_score: float,
+    ) -> str:
+        """Generate reason for captain choice."""
+        reasons = []
+
+        # Fixture
+        if fixture_score <= 2:
+            reasons.append("Easy fixture")
+        elif fixture_score <= 2.5:
+            reasons.append("Favorable fixture")
+
+        # Home advantage
+        if is_home:
+            reasons.append("Home game")
+
+        # Form
+        if player.form >= 7.0:
+            reasons.append("Excellent form")
+        elif player.form >= 5.5:
+            reasons.append("Good form")
+
+        # xGI
+        xgi = float(row.get("xGI", 0))
+        if xgi >= 0.6:
+            reasons.append(f"High xGI ({xgi:.2f})")
+
+        # Premium
+        if player.now_cost >= 12.0:
+            reasons.append("Premium asset")
+
+        # Ownership (differential)
+        ownership = float(row.get("selected_by", player.selected_by_percent))
+        if ownership < 10.0:
+            reasons.append(f"Differential ({ownership:.1f}%)")
+        elif ownership > 40.0:
+            reasons.append(f"Template pick ({ownership:.1f}%)")
+
+        if not reasons:
+            reasons.append("Consistent performer")
+
+        return "; ".join(reasons[:3])
+
+
+# =============================================================================
+# Chip Strategy Advisor
+# =============================================================================
+
+class ChipStrategyAdvisor:
+    """
+    Advises on optimal chip usage timing.
+
+    Detects:
+    - Wildcard opportunities (injuries, fixture swings)
+    - Bench boost timing (double gameweeks)
+    - Free hit opportunities (blank gameweeks)
+    - Triple captain opportunities
+    """
+
+    # Thresholds for recommendations
+    WILDCARD_THRESHOLD = 60  # Score out of 100 to recommend
+    BENCH_BOOST_THRESHOLD = 70
+    FREE_HIT_THRESHOLD = 50
+    TRIPLE_CAPTAIN_THRESHOLD = 65
+
+    def __init__(
+        self,
+        squad: list[Player],
+        player_df: pd.DataFrame,
+        fixtures_df: pd.DataFrame,
+        available_chips: list[str],
+        free_transfers: int = 1,
+    ):
+        """
+        Initialize chip strategy advisor.
+
+        Args:
+            squad: Current squad.
+            player_df: Player analysis DataFrame.
+            fixtures_df: Fixture ticker DataFrame.
+            available_chips: List of available chip names.
+            free_transfers: Current free transfers.
+        """
+        self.squad = squad
+        self.player_df = player_df
+        self.fixtures_df = fixtures_df
+        self.available_chips = available_chips
+        self.free_transfers = free_transfers
+        self.logger = logging.getLogger("fpl_agent.optimizer.chips")
+
+    def analyze(self, gameweeks_ahead: int = 5) -> list[ChipRecommendation]:
+        """
+        Analyze and recommend chip usage.
+
+        Args:
+            gameweeks_ahead: Number of gameweeks to analyze.
+
+        Returns:
+            List of ChipRecommendation objects.
+        """
+        recommendations = []
+
+        # Analyze each chip type
+        if "wildcard" in self.available_chips:
+            wc_rec = self._analyze_wildcard()
+            if wc_rec:
+                recommendations.append(wc_rec)
+
+        if "bench_boost" in self.available_chips:
+            bb_rec = self._analyze_bench_boost()
+            if bb_rec:
+                recommendations.append(bb_rec)
+
+        if "free_hit" in self.available_chips:
+            fh_rec = self._analyze_free_hit()
+            if fh_rec:
+                recommendations.append(fh_rec)
+
+        if "triple_captain" in self.available_chips:
+            tc_rec = self._analyze_triple_captain()
+            if tc_rec:
+                recommendations.append(tc_rec)
+
+        # Sort by score
+        recommendations.sort(key=lambda x: -x.score)
+
+        return recommendations
+
+    def _analyze_wildcard(self) -> Optional[ChipRecommendation]:
+        """Analyze wildcard opportunity."""
+        score = 0.0
+        reasons = []
+
+        # Factor 1: Squad injuries
+        injured_count = self._count_injured_players()
+        if injured_count >= 4:
+            score += 30
+            reasons.append(f"{injured_count} injured/doubtful players")
+        elif injured_count >= 2:
+            score += 15
+            reasons.append(f"{injured_count} players with concerns")
+
+        # Factor 2: Fixture swing
+        fixture_score = self._calculate_fixture_swing()
+        if fixture_score > 20:
+            score += 25
+            reasons.append("Major fixture swing opportunity")
+        elif fixture_score > 10:
+            score += 15
+            reasons.append("Moderate fixture swing")
+
+        # Factor 3: Squad value (underperforming assets)
+        underperformers = self._count_underperformers()
+        if underperformers >= 5:
+            score += 25
+            reasons.append(f"{underperformers} underperforming assets")
+        elif underperformers >= 3:
+            score += 15
+            reasons.append(f"{underperformers} transfers needed")
+
+        # Factor 4: Free transfer bank
+        if self.free_transfers <= 1:
+            score += 10
+            reasons.append("Low free transfers")
+
+        is_recommended = score >= self.WILDCARD_THRESHOLD
+
+        return ChipRecommendation(
+            chip_name="wildcard",
+            gameweek=1,  # This gameweek
+            score=min(100, score),
+            reasons=reasons,
+            is_recommended=is_recommended,
+        )
+
+    def _analyze_bench_boost(self) -> Optional[ChipRecommendation]:
+        """Analyze bench boost opportunity."""
+        score = 0.0
+        reasons = []
+
+        # Factor 1: Double gameweek detection
+        dgw_teams = self._detect_double_gameweek()
+        if dgw_teams >= 4:
+            score += 40
+            reasons.append(f"Double GW with {dgw_teams} teams")
+        elif dgw_teams >= 2:
+            score += 20
+            reasons.append(f"Partial DGW ({dgw_teams} teams)")
+
+        # Factor 2: Bench strength
+        bench_score = self._calculate_bench_strength()
+        if bench_score >= 20:
+            score += 30
+            reasons.append("Strong bench players")
+        elif bench_score >= 12:
+            score += 15
+            reasons.append("Decent bench")
+
+        # Factor 3: Bench fixtures
+        bench_fixtures = self._calculate_bench_fixtures()
+        if bench_fixtures <= 2.5:
+            score += 20
+            reasons.append("Favorable bench fixtures")
+        elif bench_fixtures <= 3.0:
+            score += 10
+            reasons.append("Okay bench fixtures")
+
+        is_recommended = score >= self.BENCH_BOOST_THRESHOLD
+
+        return ChipRecommendation(
+            chip_name="bench_boost",
+            gameweek=1,
+            score=min(100, score),
+            reasons=reasons,
+            is_recommended=is_recommended,
+        )
+
+    def _analyze_free_hit(self) -> Optional[ChipRecommendation]:
+        """Analyze free hit opportunity."""
+        score = 0.0
+        reasons = []
+
+        # Factor 1: Blank gameweek (many teams not playing)
+        blanks = self._detect_blank_gameweek()
+        if blanks >= 6:
+            score += 50
+            reasons.append(f"Blank GW - {blanks} teams not playing")
+        elif blanks >= 3:
+            score += 25
+            reasons.append(f"Partial blank ({blanks} teams)")
+
+        # Factor 2: Squad players affected
+        squad_blanks = self._count_squad_blanks()
+        if squad_blanks >= 5:
+            score += 30
+            reasons.append(f"{squad_blanks} squad players blanking")
+        elif squad_blanks >= 3:
+            score += 15
+            reasons.append(f"{squad_blanks} players affected")
+
+        # Factor 3: Alternative attractive fixtures
+        attractive = self._count_attractive_fixtures()
+        if attractive >= 5:
+            score += 20
+            reasons.append("Many attractive alternatives")
+
+        is_recommended = score >= self.FREE_HIT_THRESHOLD
+
+        return ChipRecommendation(
+            chip_name="free_hit",
+            gameweek=1,
+            score=min(100, score),
+            reasons=reasons,
+            is_recommended=is_recommended,
+        )
+
+    def _analyze_triple_captain(self) -> Optional[ChipRecommendation]:
+        """Analyze triple captain opportunity."""
+        score = 0.0
+        reasons = []
+
+        # Factor 1: DGW premium player
+        premium_dgw = self._has_premium_dgw_player()
+        if premium_dgw:
+            score += 40
+            reasons.append("Premium player with DGW")
+
+        # Factor 2: Easy fixture for premium
+        premium_fixture = self._get_premium_fixture_score()
+        if premium_fixture <= 2.0:
+            score += 30
+            reasons.append("Very easy premium fixture")
+        elif premium_fixture <= 2.5:
+            score += 20
+            reasons.append("Favorable premium fixture")
+
+        # Factor 3: Premium form
+        premium_form = self._get_premium_form()
+        if premium_form >= 7.0:
+            score += 25
+            reasons.append("Premium in excellent form")
+        elif premium_form >= 5.5:
+            score += 15
+            reasons.append("Premium in good form")
+
+        is_recommended = score >= self.TRIPLE_CAPTAIN_THRESHOLD
+
+        return ChipRecommendation(
+            chip_name="triple_captain",
+            gameweek=1,
+            score=min(100, score),
+            reasons=reasons,
+            is_recommended=is_recommended,
+        )
+
+    # Helper methods for chip analysis
+
+    def _count_injured_players(self) -> int:
+        """Count injured/doubtful players in squad."""
+        count = 0
+        for player in self.squad:
+            row = self.player_df[self.player_df["player_id"] == player.id]
+            if not row.empty:
+                availability = float(row.iloc[0].get("availability", 1.0))
+                if availability < 0.75:
+                    count += 1
+        return count
+
+    def _calculate_fixture_swing(self) -> float:
+        """Calculate fixture difficulty swing score."""
+        if self.fixtures_df is None or self.fixtures_df.empty:
+            return 0.0
+
+        # Compare current squad's fixtures vs best available
+        squad_teams = {p.team for p in self.squad}
+        squad_fixtures = self.fixtures_df[
+            self.fixtures_df["team_id"].isin(squad_teams)
+        ]
+        if squad_fixtures.empty:
+            return 0.0
+
+        squad_avg = squad_fixtures["avg_difficulty"].mean()
+        best_avg = self.fixtures_df["avg_difficulty"].min()
+
+        return (squad_avg - best_avg) * 10
+
+    def _count_underperformers(self) -> int:
+        """Count underperforming squad players."""
+        count = 0
+        for player in self.squad:
+            row = self.player_df[self.player_df["player_id"] == player.id]
+            if not row.empty:
+                row = row.iloc[0]
+                form = float(row.get("form", 0))
+                value = float(row.get("value", 0))
+                if form < 3.5 or value < 3.0:
+                    count += 1
+        return count
+
+    def _detect_double_gameweek(self) -> int:
+        """Detect teams with double gameweek fixtures."""
+        # This would check for DGW from fixture data
+        # Simplified: check for multiple fixtures in gw columns
+        return 0  # Would need DGW data
+
+    def _calculate_bench_strength(self) -> float:
+        """Calculate total expected points from bench."""
+        if len(self.squad) < 15:
+            return 0.0
+
+        bench = self.squad[11:15]  # Last 4 players
+        total = 0.0
+
+        for player in bench:
+            row = self.player_df[self.player_df["player_id"] == player.id]
+            if not row.empty:
+                total += float(row.iloc[0].get("gw1_projected", 0) or row.iloc[0].get("form", 0))
+
+        return total
+
+    def _calculate_bench_fixtures(self) -> float:
+        """Calculate average fixture difficulty for bench."""
+        if len(self.squad) < 15:
+            return 3.0
+
+        bench = self.squad[11:15]
+        difficulties = []
+
+        for player in bench:
+            row = self.player_df[self.player_df["player_id"] == player.id]
+            if not row.empty:
+                difficulties.append(float(row.iloc[0].get("fixture_difficulty", 3.0)))
+
+        return sum(difficulties) / len(difficulties) if difficulties else 3.0
+
+    def _detect_blank_gameweek(self) -> int:
+        """Detect number of teams with blank gameweek."""
+        if self.fixtures_df is None:
+            return 0
+        # Check for teams with no fixture (BGW)
+        bgw_count = 0
+        for _, row in self.fixtures_df.iterrows():
+            if row.get("gw1_fixture", "") == "BGW":
+                bgw_count += 1
+        return bgw_count
+
+    def _count_squad_blanks(self) -> int:
+        """Count squad players with blank gameweek."""
+        count = 0
+        for player in self.squad:
+            row = self.player_df[self.player_df["player_id"] == player.id]
+            if not row.empty:
+                fixture = str(row.iloc[0].get("gw1_fixture", ""))
+                if fixture == "BGW" or not fixture:
+                    count += 1
+        return count
+
+    def _count_attractive_fixtures(self) -> int:
+        """Count teams with very attractive fixtures."""
+        if self.fixtures_df is None:
+            return 0
+        return len(self.fixtures_df[self.fixtures_df["avg_difficulty"] <= 2.5])
+
+    def _has_premium_dgw_player(self) -> bool:
+        """Check if any premium player has DGW."""
+        # Simplified - would need DGW data
+        return False
+
+    def _get_premium_fixture_score(self) -> float:
+        """Get fixture difficulty for best premium player."""
+        premiums = [p for p in self.squad if p.now_cost >= 10.0]
+        if not premiums:
+            return 3.0
+
+        best_fixture = 5.0
+        for player in premiums:
+            row = self.player_df[self.player_df["player_id"] == player.id]
+            if not row.empty:
+                fixture = float(row.iloc[0].get("fixture_difficulty", 3.0))
+                best_fixture = min(best_fixture, fixture)
+
+        return best_fixture
+
+    def _get_premium_form(self) -> float:
+        """Get form of best premium player."""
+        premiums = [p for p in self.squad if p.now_cost >= 10.0]
+        if not premiums:
+            return 0.0
+
+        return max(p.form for p in premiums)
+
+
+# =============================================================================
+# Main Optimizer Class
+# =============================================================================
+
+class Optimizer:
+    """
+    Main optimizer combining transfer, captain, and chip strategies.
+
+    Usage:
+        optimizer = Optimizer(config, client, collector)
+        result = await optimizer.optimize()
+        print(optimizer.format_recommendations(result))
+    """
+
+    # Squad constraints
+    SQUAD_SIZE = 15
+    MAX_FROM_TEAM = 3
+    POSITION_LIMITS = {
+        Position.GOALKEEPER: (2, 2),
+        Position.DEFENDER: (5, 5),
+        Position.MIDFIELDER: (5, 5),
+        Position.FORWARD: (3, 3),
+    }
+
+    def __init__(self, config: Config, client: FPLClient, collector: DataCollector):
+        """
+        Initialize the optimizer.
+
+        Args:
+            config: Application configuration.
+            client: FPL API client.
+            collector: Data collector instance.
+        """
+        self.config = config
+        self.client = client
+        self.collector = collector
+        self.logger = logging.getLogger("fpl_agent.optimizer")
+
+    async def optimize(
+        self,
+        include_chips: bool = True,
+        available_chips: Optional[list[str]] = None,
+    ) -> OptimizationResult:
+        """
+        Run full optimization for transfers, captain, and chips.
+
+        Args:
+            include_chips: Whether to include chip recommendations.
+            available_chips: List of available chips (defaults to all).
+
+        Returns:
+            OptimizationResult with all recommendations.
+        """
+        self.logger.info("Starting optimization process")
+
+        result = OptimizationResult()
+
+        try:
+            # Get current team data
+            my_team = await self.client.get_my_team()
+            players = await self.client.get_players()
+            player_map = {p.id: p for p in players}
+
+            # Get current squad
+            current_picks = my_team["picks"]
+            current_squad = [
+                player_map[p["element"]]
+                for p in current_picks
+                if p["element"] in player_map
+            ]
+
+            # Get transfer info
+            transfers_info = my_team.get("transfers", {})
+            bank = transfers_info.get("bank", 0) / 10
+            free_transfers = max(0, transfers_info.get("limit", 1) - transfers_info.get("made", 0))
+
+            self.logger.info(f"Bank: {bank:.1f}m, Free transfers: {free_transfers}")
+
+            # Get player DataFrame
+            player_df = self.collector.get_players_dataframe()
+            if player_df is None:
+                player_df = await self.collector.collect_all()
+
+            # 1. Optimize Transfers
+            transfer_optimizer = TransferOptimizer(
+                current_squad=current_squad,
+                player_df=player_df,
+                budget=bank,
+                free_transfers=free_transfers,
+                max_transfers=min(free_transfers + 1, self.config.max_transfers_per_week),
+            )
+            result.transfers = transfer_optimizer.optimize()
+
+            # Calculate totals
+            result.total_expected_gain = sum(t.expected_gain for t in result.transfers)
+            result.total_hit_cost = sum(t.hit_cost for t in result.transfers)
+            result.net_expected_gain = sum(t.net_gain for t in result.transfers)
+
+            # 2. Select Captain
+            starting_xi = current_squad[:11]
+            captain_selector = CaptainSelector(starting_xi, player_df)
+            captain_recs = captain_selector.select()
+
+            if captain_recs:
+                result.captain = captain_recs[0]
+                if len(captain_recs) > 1:
+                    result.vice_captain = captain_recs[1]
+
+                # Find best differential captain
+                differentials = [c for c in captain_recs if c.is_differential]
+                if differentials:
+                    result.differential_captain = differentials[0]
+
+            # 3. Chip Strategy
+            if include_chips:
+                if available_chips is None:
+                    available_chips = ["wildcard", "bench_boost", "free_hit", "triple_captain"]
+
+                fixtures_df = self.collector.get_fixture_ticker()
+                chip_advisor = ChipStrategyAdvisor(
+                    squad=current_squad,
+                    player_df=player_df,
+                    fixtures_df=fixtures_df,
+                    available_chips=available_chips,
+                    free_transfers=free_transfers,
+                )
+                result.chip_recommendations = chip_advisor.analyze()
+
+            self.logger.info(
+                f"Optimization complete: {len(result.transfers)} transfers, "
+                f"{len(result.chip_recommendations)} chip suggestions"
+            )
+
+        except Exception as e:
+            self.logger.error(f"Optimization failed: {e}")
+            result.warnings.append(f"Optimization error: {str(e)}")
+
+        return result
+
+    def optimize_transfers_offline(
+        self,
+        current_squad: list[Player],
+        player_df: pd.DataFrame,
+        budget: float,
+        free_transfers: int,
+        max_transfers: int = 2,
+    ) -> list[TransferRecommendation]:
+        """
+        Optimize transfers without API calls (for testing).
+
+        Args:
+            current_squad: Current squad players.
+            player_df: Player DataFrame.
+            budget: Available budget.
+            free_transfers: Free transfers available.
+            max_transfers: Maximum transfers to make.
+
+        Returns:
+            List of TransferRecommendation objects.
+        """
+        optimizer = TransferOptimizer(
+            current_squad=current_squad,
+            player_df=player_df,
+            budget=budget,
+            free_transfers=free_transfers,
+            max_transfers=max_transfers,
+        )
+        return optimizer.optimize()
+
+    def select_captain_offline(
+        self,
+        squad: list[Player],
+        player_df: pd.DataFrame,
+    ) -> list[CaptainRecommendation]:
+        """
+        Select captain without API calls (for testing).
+
+        Args:
+            squad: Starting XI.
+            player_df: Player DataFrame.
+
+        Returns:
+            List of CaptainRecommendation objects.
+        """
+        selector = CaptainSelector(squad, player_df)
+        return selector.select()
+
+    def validate_squad(self, squad: list[Player]) -> list[str]:
+        """
+        Validate squad meets FPL rules.
+
+        Args:
+            squad: List of players in squad.
+
+        Returns:
+            List of validation error messages.
+        """
+        errors = []
+
+        # Check squad size
+        if len(squad) != self.SQUAD_SIZE:
+            errors.append(f"Squad must have {self.SQUAD_SIZE} players, has {len(squad)}")
+
+        # Check position limits
+        position_counts = {}
+        for player in squad:
+            pos = Position(player.element_type)
+            position_counts[pos] = position_counts.get(pos, 0) + 1
+
+        for position, (min_count, max_count) in self.POSITION_LIMITS.items():
+            count = position_counts.get(position, 0)
+            if count < min_count:
+                errors.append(f"Need at least {min_count} {position.name}s, have {count}")
+            if count > max_count:
+                errors.append(f"Maximum {max_count} {position.name}s allowed, have {count}")
+
+        # Check team limits
+        team_counts = {}
+        for player in squad:
+            team_counts[player.team] = team_counts.get(player.team, 0) + 1
+            if team_counts[player.team] > self.MAX_FROM_TEAM:
+                errors.append(f"Maximum {self.MAX_FROM_TEAM} players from same team")
+
+        return errors
+
+    def validate_formation(self, starting_xi: list[Player]) -> tuple[bool, str]:
+        """
+        Validate starting XI has valid formation.
+
+        Args:
+            starting_xi: List of 11 starting players.
+
+        Returns:
+            Tuple of (is_valid, formation_string).
+        """
+        if len(starting_xi) != 11:
+            return False, "Invalid XI size"
+
+        pos_counts = {1: 0, 2: 0, 3: 0, 4: 0}
+        for player in starting_xi:
+            pos_counts[player.element_type] = pos_counts.get(player.element_type, 0) + 1
+
+        formation = (pos_counts[1], pos_counts[2], pos_counts[3], pos_counts[4])
+
+        if formation in VALID_FORMATIONS:
+            return True, f"{formation[1]}-{formation[2]}-{formation[3]}"
+
+        return False, f"Invalid: {formation[1]}-{formation[2]}-{formation[3]}"
+
+    def format_recommendations(self, result: OptimizationResult) -> str:
+        """
+        Format optimization results for display.
+
+        Args:
+            result: Optimization result to format.
+
+        Returns:
+            Formatted string.
+        """
+        lines = []
+        lines.append("=" * 70)
+        lines.append("FPL AGENT RECOMMENDATIONS")
+        lines.append("=" * 70)
+
+        # Transfers
+        lines.append("\n[TRANSFERS] TRANSFER RECOMMENDATIONS:")
+        lines.append("-" * 70)
+        if result.transfers:
+            for i, transfer in enumerate(result.transfers, 1):
+                lines.append(f"  {i}. {transfer}")
+
+            lines.append("")
+            lines.append(f"  Expected gain: {result.total_expected_gain:+.2f} pts")
+            if result.total_hit_cost < 0:
+                lines.append(f"  Hit cost: {result.total_hit_cost} pts")
+            lines.append(f"  Net expected gain: {result.net_expected_gain:+.2f} pts")
+        else:
+            lines.append("  No transfers recommended - squad is strong")
+
+        # Captain
+        lines.append("\n[CAPTAIN] CAPTAIN RECOMMENDATION:")
+        lines.append("-" * 70)
+        if result.captain:
+            lines.append(f"  Captain: {result.captain}")
+        if result.vice_captain:
+            lines.append(f"  Vice-Captain: {result.vice_captain}")
+        if result.differential_captain:
+            lines.append(f"  Differential: {result.differential_captain}")
+
+        # Chip Strategy
+        if result.chip_recommendations:
+            lines.append("\n[CHIPS] CHIP STRATEGY:")
+            lines.append("-" * 70)
+            for chip in result.chip_recommendations:
+                status = ">>> PLAY" if chip.is_recommended else "   Hold"
+                lines.append(f"  {status} {chip.chip_name.upper()}: Score {chip.score:.0f}/100")
+                for reason in chip.reasons[:2]:
+                    lines.append(f"         - {reason}")
+
+        # Warnings
+        if result.warnings:
+            lines.append("\n[!] WARNINGS:")
+            lines.append("-" * 70)
+            for warning in result.warnings:
+                lines.append(f"  - {warning}")
+
+        lines.append("\n" + "=" * 70)
+
+        return "\n".join(lines)
