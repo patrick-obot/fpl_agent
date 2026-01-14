@@ -1046,7 +1046,7 @@ class FPLClient:
         # Get current event history for bank and value
         current_history = None
         for event in history_data.get("current", []):
-            if event.get("event") == gw_id:
+            if event.get("event") == picks_gw_id:
                 current_history = event
                 break
 
