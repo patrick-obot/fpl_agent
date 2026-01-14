@@ -1011,12 +1011,18 @@ class FPLClient:
         """
         team_id = self.config.fpl_team_id
 
-        # Get current gameweek
-        gw = await self.get_current_gameweek()
-        gw_id = gw.id if gw else 1
+        # Get the last completed gameweek for picks (not the upcoming one)
+        # Picks are only available for gameweeks that have started
+        gameweeks = await self.get_gameweeks()
+        picks_gw_id = 1
+        for gw in gameweeks:
+            if gw.finished or gw.is_current:
+                picks_gw_id = gw.id
+            if gw.is_next:
+                break
 
-        # Fetch picks from public endpoint
-        picks_data = await self._request("GET", f"entry/{team_id}/event/{gw_id}/picks/")
+        # Fetch picks from public endpoint using last completed/current GW
+        picks_data = await self._request("GET", f"entry/{team_id}/event/{picks_gw_id}/picks/")
 
         # Fetch entry history for transfer info
         history_data = await self._request("GET", f"entry/{team_id}/history/")
