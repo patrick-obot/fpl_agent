@@ -63,23 +63,52 @@ def config(temp_data_dir):
     return cfg
 
 
+class MockSquadPick:
+    """Mock SquadPick for testing."""
+    def __init__(self, element, position, is_captain=False, is_vice_captain=False, multiplier=1):
+        self.element = element
+        self.position = position
+        self.is_captain = is_captain
+        self.is_vice_captain = is_vice_captain
+        self.multiplier = multiplier
+
+
+class MockMyTeam:
+    """Mock MyTeam dataclass for testing."""
+    def __init__(self):
+        self.picks = [
+            MockSquadPick(100, 1, is_captain=False, is_vice_captain=False),
+            MockSquadPick(200, 2, is_captain=True, is_vice_captain=False),
+            MockSquadPick(300, 3, is_captain=False, is_vice_captain=True),
+        ]
+        self.bank = 5.0
+        self.free_transfers = 2
+        self.transfers_made = 0
+        self.total_value = 100.0
+        self.transfers = {"bank": 50, "limit": 2, "made": 0}
+
+    @property
+    def captain_id(self):
+        for pick in self.picks:
+            if pick.is_captain:
+                return pick.element
+        return None
+
+    @property
+    def vice_captain_id(self):
+        for pick in self.picks:
+            if pick.is_vice_captain:
+                return pick.element
+        return None
+
+
 @pytest.fixture
 def mock_client():
     """Create a mock FPL client."""
     client = AsyncMock()
-    client.get_my_team.return_value = {
-        "picks": [
-            {"element": 100, "position": 1, "is_captain": False, "is_vice_captain": False},
-            {"element": 200, "position": 2, "is_captain": True, "is_vice_captain": False},
-            {"element": 300, "position": 3, "is_captain": False, "is_vice_captain": True},
-        ],
-        "transfers": {
-            "bank": 50,  # 5.0m in API format (divided by 10)
-            "limit": 2,
-            "made": 0,
-        },
-        "summary_overall_points": 500,
-    }
+
+    # Return MockMyTeam instead of dict
+    client.get_my_team.return_value = MockMyTeam()
 
     mock_gameweek = MagicMock()
     mock_gameweek.id = 21

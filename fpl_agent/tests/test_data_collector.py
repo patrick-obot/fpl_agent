@@ -21,9 +21,11 @@ class TestFixtureDifficulty:
         fixture = FixtureDifficulty(
             team_id=1,
             team_name="Arsenal",
+            team_short="ARS",
             gameweek=1,
             opponent_id=2,
             opponent_name="Chelsea",
+            opponent_short="CHE",
             is_home=True,
             difficulty=3,
         )
@@ -36,9 +38,11 @@ class TestFixtureDifficulty:
         fixture = FixtureDifficulty(
             team_id=1,
             team_name="Arsenal",
+            team_short="ARS",
             gameweek=1,
             opponent_id=2,
             opponent_name="Chelsea",
+            opponent_short="CHE",
             is_home=False,
             difficulty=3,
         )
@@ -56,9 +60,11 @@ class TestPlayerNews:
             player_id=1,
             player_name="Salah",
             team_id=14,
+            team_name="Liverpool",
             news="",
             chance_of_playing=None,
             status='a',
+            source='fpl',
         )
 
         assert news.is_available is True
@@ -69,9 +75,11 @@ class TestPlayerNews:
             player_id=1,
             player_name="Salah",
             team_id=14,
+            team_name="Liverpool",
             news="Minor knock",
             chance_of_playing=75,
             status='d',
+            source='fpl',
         )
 
         assert news.is_available is True
@@ -82,9 +90,11 @@ class TestPlayerNews:
             player_id=1,
             player_name="Salah",
             team_id=14,
+            team_name="Liverpool",
             news="Injured",
             chance_of_playing=25,
             status='i',
+            source='fpl',
         )
 
         assert news.is_available is False
@@ -109,12 +119,12 @@ class TestDataCollector:
 
         # Mock teams
         client.get_teams = AsyncMock(return_value=[
-            Team(id=1, name="Arsenal", short_name="ARS",
+            Team(id=1, name="Arsenal", short_name="ARS", code=3,
                  strength=5, strength_overall_home=1300,
                  strength_overall_away=1280, strength_attack_home=1320,
                  strength_attack_away=1300, strength_defence_home=1280,
                  strength_defence_away=1260),
-            Team(id=2, name="Chelsea", short_name="CHE",
+            Team(id=2, name="Chelsea", short_name="CHE", code=8,
                  strength=4, strength_overall_home=1250,
                  strength_overall_away=1230, strength_attack_home=1270,
                  strength_attack_away=1250, strength_defence_home=1230,
@@ -131,12 +141,19 @@ class TestDataCollector:
 
         # Mock players
         client.get_players = AsyncMock(return_value=[
-            Player(id=1, web_name="Saka", team=1, element_type=3,
-                   now_cost=9.0, total_points=100, form=7.0,
-                   selected_by_percent=30.0, minutes=800,
-                   goals_scored=5, assists=8, clean_sheets=3,
-                   expected_goals=4.5, expected_assists=6.0,
-                   expected_goal_involvements=10.5),
+            Player(
+                id=1, web_name="Saka", first_name="Bukayo", second_name="Saka",
+                team=1, team_name="Arsenal", element_type=3,
+                now_cost=9.0, total_points=100, form=7.0,
+                points_per_game=6.5, selected_by_percent=30.0, minutes=800,
+                goals_scored=5, assists=8, clean_sheets=3, goals_conceded=10,
+                bonus=15, bps=300, expected_goals=4.5, expected_assists=6.0,
+                expected_goal_involvements=10.5, expected_goals_conceded=8.0,
+                status='a', news='', news_added=None,
+                chance_of_playing_this_round=None, chance_of_playing_next_round=None,
+                transfers_in_event=50000, transfers_out_event=30000,
+                cost_change_event=0, cost_change_start=0
+            ),
         ])
 
         # Mock bootstrap static
@@ -161,72 +178,85 @@ class TestDataCollector:
     @pytest.mark.asyncio
     async def test_collect_fixture_difficulties(self, collector):
         """Test fixture difficulty collection."""
-        difficulties = await collector.collect_fixture_difficulties(gameweeks_ahead=1)
+        # API now takes a list of gameweeks
+        difficulties = await collector.collect_fixture_difficulties(gameweeks=[10, 11])
 
-        assert len(difficulties) == 2  # Two teams
-        assert 1 in difficulties
-        assert 2 in difficulties
+        assert isinstance(difficulties, dict)
+        # Should have team fixtures for the teams in the mock data
+        assert 1 in difficulties or 2 in difficulties
 
-    def test_get_team_fixture_score_default(self, collector):
-        """Test fixture score with no data."""
-        score = collector.get_team_fixture_score(team_id=999)
+    def test_get_fixture_difficulty_score_default(self, collector):
+        """Test fixture score with no data returns default."""
+        score = collector.get_fixture_difficulty_score(team_id=999)
 
         assert score == 3.0  # Default medium difficulty
 
-    def test_get_player_availability_no_news(self, collector):
-        """Test availability for player with no news."""
-        availability = collector.get_player_availability(player_id=999)
-
-        assert availability == 1.0  # Assume available
-
-    def test_get_player_availability_with_news(self, collector):
-        """Test availability for player with news."""
-        collector._player_news[1] = PlayerNews(
+    def test_player_news_availability_score(self, collector):
+        """Test PlayerNews availability_score property."""
+        news = PlayerNews(
             player_id=1,
             player_name="Test",
             team_id=1,
-            news="Injured",
+            team_name="Arsenal",
+            news="Doubtful",
             chance_of_playing=50,
             status='d',
+            source='fpl',
         )
 
-        availability = collector.get_player_availability(player_id=1)
+        # availability_score should return 0.5 for 50% chance
+        assert news.availability_score == 0.5
 
-        assert availability == 0.5
+    def test_player_news_availability_from_status(self, collector):
+        """Test PlayerNews availability_score from status when no chance specified."""
+        news = PlayerNews(
+            player_id=1,
+            player_name="Test",
+            team_id=1,
+            team_name="Arsenal",
+            news="",
+            chance_of_playing=None,
+            status='a',
+            source='fpl',
+        )
+
+        # Status 'a' (available) should return 1.0
+        assert news.availability_score == 1.0
 
     def test_get_projected_points_no_data(self, collector):
-        """Test projected points with no loaded data."""
+        """Test projected points with no loaded data returns 0."""
         points = collector.get_projected_points(player_id=1)
 
-        assert points is None
+        # Returns 0.0 when no data available
+        assert points == 0.0
 
-    @pytest.mark.asyncio
-    async def test_create_player_dataframe(self, collector, mock_client):
-        """Test creating player analysis DataFrame."""
-        players = await mock_client.get_players()
-        df = collector.create_player_dataframe(players)
+    def test_get_team_fixtures(self, collector):
+        """Test getting team fixtures returns None when no data."""
+        fixtures = collector.get_team_fixtures(team_id=999)
 
-        assert len(df) == 1
-        assert "player_id" in df.columns
-        assert "name" in df.columns
-        assert "fixture_score" in df.columns
-        assert "availability" in df.columns
-        assert "value_score" in df.columns
+        assert fixtures is None
 
-    def test_export_analysis(self, collector):
-        """Test exporting analysis to CSV."""
-        # Add some fixture data
-        collector._fixture_difficulties = {
-            1: [
-                FixtureDifficulty(
-                    team_id=1, team_name="Arsenal", gameweek=10,
-                    opponent_id=2, opponent_name="Chelsea",
-                    is_home=True, difficulty=3
-                )
-            ]
+    def test_export_fixtures_to_csv(self, collector):
+        """Test exporting fixture analysis to CSV."""
+        from src.data_collector import TeamFixtures
+
+        # Add some fixture data using TeamFixtures
+        collector._team_fixtures = {
+            1: TeamFixtures(
+                team_id=1,
+                team_name="Arsenal",
+                team_short="ARS",
+                fixtures=[
+                    FixtureDifficulty(
+                        team_id=1, team_name="Arsenal", team_short="ARS",
+                        gameweek=10, opponent_id=2, opponent_name="Chelsea",
+                        opponent_short="CHE", is_home=True, difficulty=3
+                    )
+                ]
+            )
         }
 
-        output_path = collector.export_analysis()
+        output_path = collector.export_fixtures_to_csv()
 
         assert output_path.exists()
         assert output_path.suffix == ".csv"

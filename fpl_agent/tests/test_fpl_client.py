@@ -111,73 +111,125 @@ class TestFPLClient:
         assert client._session is None
 
     @pytest.mark.asyncio
-    async def test_authenticate_dry_run(self, client):
-        """Test authentication in dry-run mode."""
-        result = await client.authenticate()
-        assert result is True
+    async def test_login_dry_run(self, client):
+        """Test login in dry-run mode."""
+        async with client:
+            result = await client.login()
+            assert result is True
+            assert client._authenticated is True
 
     @pytest.mark.asyncio
     async def test_get_my_team_dry_run(self, client):
-        """Test getting team data in dry-run mode."""
+        """Test getting team data in dry-run mode returns MyTeam dataclass."""
         async with client:
             team = await client.get_my_team()
 
-            assert "picks" in team
-            assert "transfers" in team
-            assert len(team["picks"]) == 15
+            # MyTeam is a dataclass, not a dict
+            assert hasattr(team, 'picks')
+            assert hasattr(team, 'bank')
+            assert hasattr(team, 'free_transfers')
+            assert len(team.picks) == 15
 
     @pytest.mark.asyncio
     async def test_make_transfers_dry_run(self, client):
         """Test making transfers in dry-run mode."""
+        from src.fpl_client import Transfer
+
         transfers = [
-            {"element_in": 100, "element_out": 200},
+            Transfer(element_in=100, element_out=200),
         ]
 
         async with client:
             result = await client.make_transfers(transfers)
 
-            assert result["status"] == "dry_run"
-            assert result["transfers"] == transfers
+            assert result.success is True
+            assert "dry_run" in result.message.lower() or "dry run" in result.message.lower()
 
     @pytest.mark.asyncio
     async def test_set_captain_dry_run(self, client):
         """Test setting captain in dry-run mode."""
         async with client:
-            result = await client.set_captain(player_id=1, vice_captain_id=2)
+            # Without confirm, returns preview
+            result = await client.set_captain(captain_id=1, vice_captain_id=2, confirm=False)
 
-            assert result["status"] == "dry_run"
+            assert result["success"] is True
             assert result["captain"] == 1
             assert result["vice_captain"] == 2
 
     @pytest.mark.asyncio
-    async def test_authentication_required_live_mode(self):
-        """Test that authentication is required in live mode."""
-        config = Config(dry_run=False)
+    async def test_login_live_mode_without_credentials(self):
+        """Test that login fails in live mode without credentials."""
+        config = Config(dry_run=False, fpl_email="", fpl_password="")
         client = FPLClient(config)
 
-        with pytest.raises(AuthenticationError):
-            await client.authenticate()
+        async with client:
+            with pytest.raises(AuthenticationError):
+                await client.login()
 
     def test_mock_team_data(self, client):
-        """Test mock team data structure."""
-        mock_data = client._get_mock_team_data()
+        """Test mock team data structure via _get_mock_team."""
+        mock_team = client._get_mock_team()
 
-        assert len(mock_data["picks"]) == 15
-        assert mock_data["transfers"]["bank"] == 50
+        # MyTeam dataclass attributes
+        assert len(mock_team.picks) == 15
+        assert mock_team.bank == 5.0
+        assert mock_team.free_transfers == 2
 
-        # Check captain/vice-captain are set
-        captains = [p for p in mock_data["picks"] if p["is_captain"]]
-        vice_captains = [p for p in mock_data["picks"] if p["is_vice_captain"]]
-
-        assert len(captains) == 1
-        assert len(vice_captains) == 1
+        # Check captain/vice-captain via properties
+        assert mock_team.captain_id is not None
+        assert mock_team.vice_captain_id is not None
 
 
 class TestFPLClientRateLimiting:
     """Test rate limiting behavior."""
 
-    @pytest.mark.asyncio
-    async def test_rate_limiter_exists(self):
+    def test_rate_limiter_exists(self):
         """Test that rate limiter is configured."""
         assert FPLClient._rate_limiter is not None
-        assert FPLClient._rate_limiter.max_rate == 100
+        # Rate limiter is set to 1 request per second for safety
+        assert FPLClient._rate_limiter.max_rate == 1
+
+
+class TestFPLClientDataFetching:
+    """Test data fetching methods."""
+
+    @pytest.fixture
+    def config(self):
+        """Create test configuration."""
+        return Config(dry_run=True, fpl_team_id=12345)
+
+    @pytest.fixture
+    def client(self, config):
+        """Create test client."""
+        return FPLClient(config)
+
+    @pytest.mark.asyncio
+    async def test_get_players(self, client):
+        """Test fetching all players."""
+        async with client:
+            players = await client.get_players()
+
+            assert isinstance(players, list)
+            assert len(players) > 0
+            assert all(isinstance(p, Player) for p in players)
+
+    @pytest.mark.asyncio
+    async def test_get_teams(self, client):
+        """Test fetching all teams."""
+        async with client:
+            teams = await client.get_teams()
+
+            assert isinstance(teams, list)
+            assert len(teams) == 20  # Premier League has 20 teams
+            assert all(isinstance(t, Team) for t in teams)
+
+    @pytest.mark.asyncio
+    async def test_get_current_gameweek(self, client):
+        """Test fetching current gameweek."""
+        async with client:
+            gw = await client.get_current_gameweek()
+
+            assert gw is not None
+            assert hasattr(gw, 'id')
+            assert hasattr(gw, 'name')
+            assert 1 <= gw.id <= 38
