@@ -292,30 +292,52 @@ class TransferOptimizer:
         return self._calculate_row_score(row.iloc[0])
 
     def _calculate_row_score(self, row: pd.Series) -> float:
-        """Calculate weighted score for player data row."""
+        """
+        Calculate score for player using weighted formula + projected points.
+
+        Components:
+        - Projected points from CSV (weighted by xMins)
+        - Form, fixture difficulty, xGI, points per game
+        - xMins weight: if < 60, reduce the projected points contribution
+        """
         score = 0.0
 
-        # Form (recent performance)
-        score += float(row.get("form", 0)) * 2.0
+        # 1. Projected points (primary factor when available)
+        projected_pts = float(row.get("gw1_projected", 0) or 0)
+        xmins_weight = float(row.get("gw1_mins_weight", 1.0) or 1.0)
 
-        # Fixture difficulty (inverted - lower is better)
+        if projected_pts > 0:
+            # Weight projected points by expected minutes
+            # Full weight if xMins >= 60, reduced if less
+            score += projected_pts * xmins_weight * 3.0
+
+            # Add future gameweeks with decay
+            for i in range(2, min(6, self.planning_horizon + 1)):
+                pts_col = f"gw{i}_projected"
+                weight_col = f"gw{i}_mins_weight"
+                if pts_col in row.index:
+                    future_pts = float(row.get(pts_col, 0) or 0)
+                    future_weight = float(row.get(weight_col, 1.0) or 1.0)
+                    decay = 0.5 / i  # Decay for future weeks
+                    score += future_pts * future_weight * decay
+
+        # 2. Form (recent performance)
+        score += float(row.get("form", 0)) * 1.5
+
+        # 3. Fixture difficulty (inverted - lower is better)
         fixture = float(row.get("fixture_difficulty", 3.0))
-        score += (5 - fixture) * 3.0
+        score += (5 - fixture) * 2.0
 
-        # xGI (expected goal involvement)
-        score += float(row.get("xGI", 0)) * 2.5
+        # 4. xGI (expected goal involvement)
+        score += float(row.get("xGI", 0)) * 2.0
 
-        # Projected points (weighted sum over horizon)
-        for i in range(1, min(6, self.planning_horizon + 1)):
-            col = f"gw{i}_projected"
-            if col in row:
-                weight = 1.0 / i  # Decay for future gameweeks
-                score += float(row.get(col, 0) or 0) * weight * 2.0
+        # 5. Points per game (historical)
+        score += float(row.get("points_per_game", 0)) * 1.0
 
-        # Value score (points per million)
-        score += float(row.get("value", 0)) * 1.0
+        # 6. Value score (points per million)
+        score += float(row.get("value", 0)) * 0.5
 
-        # Availability penalty
+        # 7. Availability penalty (injury/suspension)
         availability = float(row.get("availability", 1.0))
         score *= availability
 

@@ -137,10 +137,24 @@ class ProjectedPoints:
     team: str
     position: str
     gameweek_points: dict[int, float] = field(default_factory=dict)
+    gameweek_xmins: dict[int, float] = field(default_factory=dict)
 
     def get_points(self, gameweek: int) -> float:
         """Get projected points for a gameweek."""
         return self.gameweek_points.get(gameweek, 0.0)
+
+    def get_xmins(self, gameweek: int) -> float:
+        """Get expected minutes for a gameweek."""
+        return self.gameweek_xmins.get(gameweek, 0.0)
+
+    def get_minutes_weight(self, gameweek: int, min_threshold: int = 60) -> float:
+        """Get weight based on expected minutes. Returns 0-1 scale."""
+        xmins = self.get_xmins(gameweek)
+        if xmins >= min_threshold:
+            return 1.0
+        elif xmins > 0:
+            return xmins / min_threshold  # Proportional weight
+        return 0.0
 
     def total_points(self, gameweeks: list[int]) -> float:
         """Get total projected points across gameweeks."""
@@ -565,76 +579,97 @@ class DataCollector:
     # Projected Points Loading
     # -------------------------------------------------------------------------
 
-    def load_projected_points(self, gameweeks: list[int]) -> dict[int, ProjectedPoints]:
+    def load_projected_points(self, gameweeks: list[int], min_xmins: int = 60) -> dict[int, ProjectedPoints]:
         """
         Load projected points from CSV file.
 
-        Expected CSV format:
-        player_id,name,team,position,gw_points,gw+1_points,gw+2_points,...
+        Supports format with columns:
+        - ID: Player ID
+        - Name: Player name
+        - Team: Team name
+        - Pos: Position (G/D/M/F)
+        - {gw}_xMins: Expected minutes for gameweek
+        - {gw}_Pts: Expected points for gameweek
+
+        Players with xMins < min_xmins are filtered out for that gameweek.
 
         Args:
             gameweeks: List of gameweeks to load projections for.
+            min_xmins: Minimum expected minutes to consider player (default 60).
 
         Returns:
             Dictionary mapping player_id to ProjectedPoints.
         """
-        csv_path = self.config.data_dir / "projected_points.csv"
+        # Try multiple possible filenames
+        possible_files = [
+            self.config.data_dir / "projected_points.csv",
+            self.config.data_dir / "projected_points_14012026.csv.csv",
+        ]
 
-        if not csv_path.exists():
-            self.logger.warning(f"Projected points file not found: {csv_path}")
+        csv_path = None
+        for path in possible_files:
+            if path.exists():
+                csv_path = path
+                break
+
+        if not csv_path:
+            self.logger.warning(f"Projected points file not found in {self.config.data_dir}")
             return self._projected_points
 
         try:
-            df = pd.read_csv(csv_path)
+            df = pd.read_csv(csv_path, encoding='utf-8-sig')  # Handle BOM
             self.logger.info(f"Loading projected points from {csv_path}")
 
-            # Detect column format
             columns = df.columns.tolist()
 
             for _, row in df.iterrows():
-                player_id = int(row.get("player_id", 0))
+                # Get player ID - try both 'ID' and 'player_id'
+                player_id = int(row.get("ID", row.get("player_id", 0)))
                 if player_id == 0:
                     continue
 
                 gw_points = {}
+                gw_xmins = {}
 
-                # Try to parse gameweek columns
-                for col in columns:
-                    if col.startswith("gw") and "_points" in col.lower():
-                        # Handle gw_points, gw+1_points, etc.
+                # Parse gameweek columns (format: 22_Pts, 22_xMins, etc.)
+                for gw in gameweeks:
+                    pts_col = f"{gw}_Pts"
+                    xmins_col = f"{gw}_xMins"
+
+                    if pts_col in columns and xmins_col in columns:
                         try:
-                            if col == "gw_points":
-                                gw_offset = 0
-                            else:
-                                # Extract offset from gw+N_points
+                            xmins = float(row.get(xmins_col, 0) or 0)
+                            pts = float(row.get(pts_col, 0) or 0)
+
+                            gw_xmins[gw] = xmins
+                            gw_points[gw] = pts
+                        except (ValueError, TypeError):
+                            continue
+
+                # Also check for older format (gw_points, gw+1_points)
+                if not gw_points:
+                    for col in columns:
+                        if col.startswith("gw") and "_points" in col.lower():
+                            try:
                                 match = re.search(r'gw\+?(\d+)', col)
                                 if match:
                                     gw_offset = int(match.group(1))
-                                else:
-                                    continue
-
-                            if gameweeks:
-                                target_gw = gameweeks[0] + gw_offset
-                                if target_gw in gameweeks or gw_offset < len(gameweeks):
-                                    gw_points[target_gw] = float(row.get(col, 0) or 0)
-                        except (ValueError, IndexError):
-                            continue
-
-                    elif col.startswith("projected_points"):
-                        # Simple format: single projected_points column
-                        if gameweeks:
-                            gw_points[gameweeks[0]] = float(row.get(col, 0) or 0)
+                                    if gw_offset < len(gameweeks):
+                                        gw_points[gameweeks[gw_offset]] = float(row.get(col, 0) or 0)
+                            except (ValueError, TypeError):
+                                continue
 
                 if gw_points:
                     self._projected_points[player_id] = ProjectedPoints(
                         player_id=player_id,
-                        player_name=str(row.get("name", row.get("player_name", "Unknown"))),
-                        team=str(row.get("team", "")),
-                        position=str(row.get("position", "")),
+                        player_name=str(row.get("Name", row.get("name", "Unknown"))),
+                        team=str(row.get("Team", row.get("team", ""))),
+                        position=str(row.get("Pos", row.get("position", ""))),
                         gameweek_points=gw_points,
+                        gameweek_xmins=gw_xmins,
                     )
 
-            self.logger.info(f"Loaded projections for {len(self._projected_points)} players")
+            self.logger.info(f"Loaded projections for {len(self._projected_points)} players (min xMins: {min_xmins})")
 
         except Exception as e:
             self.logger.error(f"Failed to load projected points: {e}")
@@ -732,16 +767,20 @@ class DataCollector:
                 row["fixture_difficulty"] = 3.0
                 row["fixture_rating"] = "Medium"
 
-            # Projected points
+            # Projected points and expected minutes
             projection = self._projected_points.get(player.id)
             if projection:
                 row["projected_total"] = projection.total_points(gameweeks)
                 for i, gw in enumerate(gameweeks[:5]):
                     row[f"gw{i+1}_projected"] = projection.get_points(gw)
+                    row[f"gw{i+1}_xmins"] = projection.get_xmins(gw)
+                    row[f"gw{i+1}_mins_weight"] = projection.get_minutes_weight(gw)
             else:
                 row["projected_total"] = 0.0
                 for i in range(5):
                     row[f"gw{i+1}_projected"] = 0.0
+                    row[f"gw{i+1}_xmins"] = 0.0
+                    row[f"gw{i+1}_mins_weight"] = 0.0
 
             # Calculated metrics
             row["value"] = player.total_points / player.now_cost if player.now_cost > 0 else 0
