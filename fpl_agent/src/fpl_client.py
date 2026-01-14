@@ -966,12 +966,92 @@ class FPLClient:
             AuthenticationError: If not authenticated.
         """
         if self.config.dry_run:
-            self.logger.info("Dry run mode - returning mock team data")
+            # Try to fetch real team from public API first
+            if self.config.fpl_team_id:
+                try:
+                    team = await self._get_team_from_public_api()
+                    self.logger.info("Dry run mode - fetched real team from public API")
+                    return team
+                except Exception as e:
+                    self.logger.warning(f"Failed to fetch team from public API: {e}")
+                    self.logger.info("Dry run mode - falling back to mock team data")
             return self._get_mock_team()
 
         await self.ensure_authenticated()
         data = await self._request("GET", f"my-team/{self.config.fpl_team_id}/")
         return MyTeam.from_api(data)
+
+    async def _get_team_from_public_api(self) -> MyTeam:
+        """
+        Fetch team data from public API endpoints (no authentication required).
+
+        This allows fetching real team data in dry-run mode.
+        """
+        team_id = self.config.fpl_team_id
+
+        # Get current gameweek
+        gw = await self.get_current_gameweek()
+        gw_id = gw.id if gw else 1
+
+        # Fetch picks from public endpoint
+        picks_data = await self._request("GET", f"entry/{team_id}/event/{gw_id}/picks/")
+
+        # Fetch entry history for transfer info
+        history_data = await self._request("GET", f"entry/{team_id}/history/")
+
+        # Fetch entry info for chips
+        entry_data = await self._request("GET", f"entry/{team_id}/")
+
+        # Build picks list
+        picks = []
+        for p in picks_data.get("picks", []):
+            picks.append(SquadPick(
+                element=p["element"],
+                position=p["position"],
+                is_captain=p.get("is_captain", False),
+                is_vice_captain=p.get("is_vice_captain", False),
+                multiplier=p.get("multiplier", 1),
+                selling_price=p.get("selling_price", 0) / 10 if p.get("selling_price") else 5.0,
+                purchase_price=p.get("purchase_price", 0) / 10 if p.get("purchase_price") else 5.0,
+            ))
+
+        # Get current event history for bank and value
+        current_history = None
+        for event in history_data.get("current", []):
+            if event.get("event") == gw_id:
+                current_history = event
+                break
+
+        # Get latest if current not found
+        if not current_history and history_data.get("current"):
+            current_history = history_data["current"][-1]
+
+        bank = (current_history.get("bank", 0) / 10) if current_history else 0.0
+        total_value = (current_history.get("value", 1000) / 10) if current_history else 100.0
+        transfers_made = current_history.get("event_transfers", 0) if current_history else 0
+
+        # Determine free transfers (default 1-2, max 5 with rollover)
+        # This is an approximation since we can't see exact free transfers from public API
+        free_transfers = max(1, 2 - transfers_made)
+
+        # Check chip usage from history
+        chips_used = set()
+        for chip in history_data.get("chips", []):
+            chips_used.add(chip.get("name"))
+
+        return MyTeam(
+            picks=picks,
+            chips=history_data.get("chips", []),
+            transfers={"bank": int(bank * 10), "value": int(total_value * 10), "made": transfers_made},
+            bank=bank,
+            total_value=total_value,
+            free_transfers=free_transfers,
+            transfers_made=transfers_made,
+            wildcard_available="wildcard" not in chips_used,
+            freehit_available="freehit" not in chips_used,
+            benchboost_available="bboost" not in chips_used,
+            triplecaptain_available="3xc" not in chips_used,
+        )
 
     async def get_manager_info(self) -> ManagerInfo:
         """
