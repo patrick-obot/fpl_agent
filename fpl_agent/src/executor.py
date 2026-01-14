@@ -531,26 +531,30 @@ class StateManager:
             my_team = await client.get_my_team()
             current_gw = await client.get_current_gameweek()
 
-            picks = my_team.get("picks", [])
-            transfers = my_team.get("transfers", {})
+            # Convert SquadPick objects to dicts for serialization
+            picks_data = [
+                {
+                    "element": pick.element,
+                    "position": pick.position,
+                    "is_captain": pick.is_captain,
+                    "is_vice_captain": pick.is_vice_captain,
+                    "multiplier": pick.multiplier,
+                }
+                for pick in my_team.picks
+            ]
 
-            # Find captain and vice-captain
-            captain_id = 0
-            vice_captain_id = 0
-            for pick in picks:
-                if pick.get("is_captain"):
-                    captain_id = pick["element"]
-                if pick.get("is_vice_captain"):
-                    vice_captain_id = pick["element"]
+            # Get captain and vice-captain from MyTeam properties
+            captain_id = my_team.captain_id or 0
+            vice_captain_id = my_team.vice_captain_id or 0
 
             state = TeamState(
                 timestamp=datetime.now(),
-                picks=picks,
+                picks=picks_data,
                 captain_id=captain_id,
                 vice_captain_id=vice_captain_id,
-                bank=transfers.get("bank", 0) / 10,
-                free_transfers=max(0, transfers.get("limit", 1) - transfers.get("made", 0)),
-                total_points=my_team.get("summary_overall_points", 0),
+                bank=my_team.bank,
+                free_transfers=my_team.free_transfers,
+                total_points=0,  # Not available in MyTeam directly
                 gameweek=current_gw.id,
             )
 

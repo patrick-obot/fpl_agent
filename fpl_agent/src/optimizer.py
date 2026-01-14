@@ -1117,18 +1117,16 @@ class Optimizer:
             players = await self.client.get_players()
             player_map = {p.id: p for p in players}
 
-            # Get current squad
-            current_picks = my_team["picks"]
+            # Get current squad from MyTeam dataclass
             current_squad = [
-                player_map[p["element"]]
-                for p in current_picks
-                if p["element"] in player_map
+                player_map[pick.element]
+                for pick in my_team.picks
+                if pick.element in player_map
             ]
 
-            # Get transfer info
-            transfers_info = my_team.get("transfers", {})
-            bank = transfers_info.get("bank", 0) / 10
-            free_transfers = max(0, transfers_info.get("limit", 1) - transfers_info.get("made", 0))
+            # Get transfer info from MyTeam attributes
+            bank = my_team.bank
+            free_transfers = my_team.free_transfers
 
             self.logger.info(f"Bank: {bank:.1f}m, Free transfers: {free_transfers}")
 
