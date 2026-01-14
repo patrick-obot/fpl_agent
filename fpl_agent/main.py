@@ -67,7 +67,7 @@ FINAL_EXECUTION_HOURS = 2  # Hours before deadline for final execution
 
 async def get_next_deadline(client: FPLClient) -> Optional[datetime]:
     """
-    Get the next gameweek deadline.
+    Get the next gameweek deadline that is in the future.
 
     Args:
         client: FPL API client.
@@ -76,10 +76,19 @@ async def get_next_deadline(client: FPLClient) -> Optional[datetime]:
         Datetime of next deadline in UTC, or None if not available.
     """
     try:
-        gameweek = await client.get_current_gameweek()
-        if gameweek and gameweek.deadline_time:
-            return gameweek.deadline_time
-    except Exception:
+        now = datetime.now(timezone.utc)
+        gameweeks = await client.get_gameweeks()
+
+        for gw in gameweeks:
+            if gw.deadline_time:
+                deadline_utc = gw.deadline_time
+                if deadline_utc.tzinfo is None:
+                    deadline_utc = deadline_utc.replace(tzinfo=timezone.utc)
+
+                # Return first deadline that's in the future
+                if deadline_utc > now:
+                    return gw.deadline_time
+    except Exception as e:
         pass
     return None
 
