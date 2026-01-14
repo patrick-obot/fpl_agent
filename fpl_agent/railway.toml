@@ -2,8 +2,7 @@
 # https://docs.railway.app/reference/config-as-code
 
 [build]
-builder = "DOCKERFILE"
-dockerfilePath = "Dockerfile"
+builder = "NIXPACKS"
 
 [deploy]
 # Number of instances
