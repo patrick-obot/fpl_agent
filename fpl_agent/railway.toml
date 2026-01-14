@@ -1,0 +1,49 @@
+# Railway Configuration for FPL Agent
+# https://docs.railway.app/reference/config-as-code
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Number of instances
+numReplicas = 1
+# Health check (disabled for cron-based service)
+healthcheckPath = ""
+# Restart policy
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+# ============================================================================
+# CRON JOBS
+# ============================================================================
+# Railway cron syntax: minute hour day month weekday
+# Times are in UTC
+
+# Daily price change monitoring at 1:30 AM UTC
+# Runs every day to catch early price rises/falls
+[[cron]]
+schedule = "30 1 * * *"
+command = "python main.py price-check"
+
+# Preparation run - 48 hours before typical Saturday deadline (Thursday 11:00 UTC)
+# Runs Thursday at 11:00 UTC for analysis and early recommendations
+[[cron]]
+schedule = "0 11 * * 4"
+command = "python main.py --deadline-hours 48"
+
+# Final execution - 2 hours before typical Saturday deadline (Saturday 9:00 UTC)
+# Runs Saturday at 9:00 UTC for final transfers before 11:00 deadline
+[[cron]]
+schedule = "0 9 * * 6"
+command = "python main.py --deadline-hours 2"
+
+# Midweek gameweek support - Tuesday preparation (for Wednesday deadlines)
+[[cron]]
+schedule = "0 11 * * 1"
+command = "python main.py --deadline-hours 48"
+
+# Midweek final - Tuesday 16:00 UTC (for 18:00 deadlines)
+[[cron]]
+schedule = "0 16 * * 2"
+command = "python main.py --deadline-hours 2"

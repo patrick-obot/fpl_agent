@@ -1,0 +1,46 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+.eggs
+dist
+build
+
+# Virtual environments
+venv
+.venv
+env
+.env.local
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Testing
+.pytest_cache
+.coverage
+htmlcov
+.tox
+
+# Local data (will be created fresh in container)
+data/*.csv
+data/*.pkl
+data/*.json
+data/states/
+logs/
+
+# Documentation
+*.md
+!README.md
+
+# Tests (not needed in production)
+tests/
