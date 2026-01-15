@@ -1,5 +1,6 @@
 # FPL Agent Docker Image for Railway Deployment
-FROM python:3.11-slim
+# Uses Playwright for authentication
+FROM mcr.microsoft.com/playwright/python:v1.49.0-noble
 
 # Set working directory
 WORKDIR /app
@@ -9,16 +10,14 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
-
 # Copy requirements first for better caching
 COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Playwright browsers (chromium only for smaller image)
+RUN playwright install chromium
 
 # Copy application code
 COPY . .

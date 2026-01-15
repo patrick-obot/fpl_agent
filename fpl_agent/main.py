@@ -112,7 +112,7 @@ def is_deadline_approaching(deadline: datetime, threshold_hours: float = 48) -> 
 # =============================================================================
 
 async def run_agent(
-    mode: str = 'dry-run',
+    mode: str = None,  # None = use .env setting
     notify: str = 'none',
     deadline_hours: float = 2.0,
     confirm: bool = False,
@@ -140,12 +140,16 @@ async def run_agent(
         Exit code (0 for success, 1 for failure).
     """
     config = Config.from_env()
-    config.dry_run = (mode == 'dry-run')
+    # Use mode argument if provided, otherwise use .env setting
+    if mode is not None:
+        config.dry_run = (mode == 'dry-run')
+    # mode variable for logging
+    effective_mode = 'dry-run' if config.dry_run else 'live'
     logger = config.logger
 
     logger.info("=" * 70)
     logger.info("FPL AGENT STARTING")
-    logger.info(f"Mode: {mode.upper()} | Notify: {notify} | Deadline threshold: {deadline_hours}h")
+    logger.info(f"Mode: {effective_mode.upper()} | Notify: {notify} | Deadline threshold: {deadline_hours}h")
     logger.info("=" * 70)
     config.log_config()
 
@@ -162,7 +166,7 @@ async def run_agent(
             if not config.dry_run:
                 logger.info("Authenticating with FPL...")
                 try:
-                    await client.authenticate()
+                    await client.login()
                     logger.info("Authentication successful")
                 except AuthenticationError as e:
                     logger.error(f"Authentication failed: {e}")
@@ -229,8 +233,12 @@ async def run_agent(
             optimizer = Optimizer(config, client, collector)
             optimization_result = await optimizer.optimize()
 
+            # Get players for name lookup in output
+            players = await client.get_players()
+            player_map = {p.id: p for p in players}
+
             # Display recommendations
-            recommendations = optimizer.format_recommendations(optimization_result)
+            recommendations = optimizer.format_recommendations(optimization_result, player_map)
             print(recommendations)
             logger.info(recommendations)
 
@@ -496,7 +504,7 @@ async def run_scheduler() -> None:
                     if last_preparation != prep_date:
                         logger.info(f"\n>>> Running preparation ({hours_left:.1f}h before deadline)")
                         await run_agent(
-                            mode='dry-run',
+                            mode='live',
                             notify='email',
                             deadline_hours=FINAL_EXECUTION_HOURS
                         )
@@ -545,7 +553,7 @@ async def approve_plan(plan_id: str) -> int:
 
     try:
         async with FPLClient(config) as client:
-            await client.authenticate()
+            await client.login()
 
             executor = Executor(config, client)
             result = await executor.approve(plan_id, approved_by="cli")
@@ -656,8 +664,8 @@ Cron Examples (for crontab):
     parser.add_argument(
         '--mode',
         choices=['dry-run', 'live'],
-        default='dry-run',
-        help='Execution mode (default: dry-run)'
+        default=None,  # None = use DRY_RUN from .env
+        help='Execution mode (default: uses DRY_RUN from .env)'
     )
 
     parser.add_argument(

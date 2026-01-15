@@ -119,6 +119,19 @@ class ChipRecommendation:
 
 
 @dataclass
+class BenchOrder:
+    """Recommended bench order."""
+    bench_gk: Optional[int] = None  # Player ID for bench GK
+    bench_1: Optional[int] = None   # First sub (highest xPts outfield)
+    bench_2: Optional[int] = None   # Second sub
+    bench_3: Optional[int] = None   # Third sub (lowest xPts outfield)
+
+    def to_list(self) -> list[int]:
+        """Return bench order as list of player IDs."""
+        return [p for p in [self.bench_gk, self.bench_1, self.bench_2, self.bench_3] if p]
+
+
+@dataclass
 class OptimizationResult:
     """Results of the optimization process."""
     transfers: list[TransferRecommendation] = field(default_factory=list)
@@ -126,6 +139,8 @@ class OptimizationResult:
     vice_captain: Optional[CaptainRecommendation] = None
     differential_captain: Optional[CaptainRecommendation] = None
     chip_recommendations: list[ChipRecommendation] = field(default_factory=list)
+    starting_xi: list[int] = field(default_factory=list)  # Player IDs for starting 11
+    bench_order: Optional[BenchOrder] = None
     total_expected_gain: float = 0.0
     total_hit_cost: int = 0
     net_expected_gain: float = 0.0
@@ -151,7 +166,9 @@ class TransferOptimizer:
 
     HIT_PENALTY = -4
     MAX_FROM_TEAM = 3
-    MIN_IMPROVEMENT_THRESHOLD = 2.0  # Minimum improvement to suggest transfer
+    MIN_IMPROVEMENT_THRESHOLD = 4.0  # Minimum improvement to suggest transfer
+    INJURY_REPLACEMENT_THRESHOLD = 2.0  # Lower threshold for replacing injured players
+    HIT_WORTHWHILE_THRESHOLD = 8.0  # Net gain must exceed this to justify a hit
 
     def __init__(
         self,
@@ -444,13 +461,24 @@ class TransferOptimizer:
     def _apply_transfer_limits(
         self, recommendations: list[TransferRecommendation]
     ) -> list[TransferRecommendation]:
-        """Apply transfer limits and calculate hit costs."""
+        """
+        Apply transfer limits and calculate hit costs.
+
+        Only uses free transfers by default. Hits are only taken when:
+        - Replacing injured/unavailable players (priority 1)
+        - Exceptional gain that justifies the -4 cost
+        """
         final = []
         transfers_used = 0
+        players_in = set()  # Track players already being transferred in
+        players_out = set()  # Track players already being transferred out
 
         for rec in recommendations:
-            if transfers_used >= self.max_transfers:
-                break
+            # Skip if this player is already being transferred in or out
+            if rec.player_in.id in players_in:
+                continue
+            if rec.player_out.id in players_out:
+                continue
 
             # Calculate hit cost
             if transfers_used < self.free_transfers:
@@ -460,10 +488,30 @@ class TransferOptimizer:
 
             rec.net_gain = rec.expected_gain + rec.hit_cost
 
-            # Only include if net gain is positive
-            if rec.net_gain > 0:
-                final.append(rec)
-                transfers_used += 1
+            # Determine if transfer should be included
+            is_injury_replacement = rec.priority == 1  # Priority 1 = injury/unavailable
+            is_free_transfer = transfers_used < self.free_transfers
+
+            if is_free_transfer:
+                # Free transfers: include if net gain is positive
+                if rec.net_gain > 0:
+                    final.append(rec)
+                    transfers_used += 1
+                    players_in.add(rec.player_in.id)
+                    players_out.add(rec.player_out.id)
+            else:
+                # Hit transfer: only for injuries or exceptional gains
+                if is_injury_replacement and rec.net_gain > 0:
+                    final.append(rec)
+                    transfers_used += 1
+                    players_in.add(rec.player_in.id)
+                    players_out.add(rec.player_out.id)
+                elif rec.net_gain >= self.HIT_WORTHWHILE_THRESHOLD:
+                    # Exceptional gain that justifies the hit
+                    final.append(rec)
+                    transfers_used += 1
+                    players_in.add(rec.player_in.id)
+                    players_out.add(rec.player_out.id)
 
         return final
 
@@ -1158,12 +1206,14 @@ class Optimizer:
                 player_df = await self.collector.collect_all()
 
             # 1. Optimize Transfers
+            # max_transfers allows buffer for injury replacements, but _apply_transfer_limits
+            # will only use free transfers unless there's injury or exceptional gain
             transfer_optimizer = TransferOptimizer(
                 current_squad=current_squad,
                 player_df=player_df,
                 budget=bank,
                 free_transfers=free_transfers,
-                max_transfers=min(free_transfers + 1, self.config.max_transfers_per_week),
+                max_transfers=free_transfers + 2,  # Buffer for injury hits
             )
             result.transfers = transfer_optimizer.optimize()
 
@@ -1172,9 +1222,27 @@ class Optimizer:
             result.total_hit_cost = sum(t.hit_cost for t in result.transfers)
             result.net_expected_gain = sum(t.net_gain for t in result.transfers)
 
-            # 2. Select Captain
-            starting_xi = current_squad[:11]
-            captain_selector = CaptainSelector(starting_xi, player_df)
+            # Build post-transfer squad
+            transferred_in_ids = set()
+            post_transfer_squad = list(current_squad)
+            for transfer in result.transfers:
+                # Remove outgoing player
+                post_transfer_squad = [p for p in post_transfer_squad if p.id != transfer.player_out.id]
+                # Add incoming player
+                post_transfer_squad.append(transfer.player_in)
+                transferred_in_ids.add(transfer.player_in.id)
+
+            # 2. Select Starting XI and Bench Order
+            result.starting_xi, result.bench_order = self.select_starting_xi_and_bench(
+                squad=post_transfer_squad,
+                player_df=player_df,
+                transferred_in_ids=transferred_in_ids,
+                gameweek=1,
+            )
+
+            # Get starting XI players for captain selection
+            starting_xi_players = [p for p in post_transfer_squad if p.id in result.starting_xi]
+            captain_selector = CaptainSelector(starting_xi_players, player_df)
             captain_recs = captain_selector.select()
 
             if captain_recs:
@@ -1299,6 +1367,142 @@ class Optimizer:
 
         return errors
 
+    def select_starting_xi_and_bench(
+        self,
+        squad: list[Player],
+        player_df: pd.DataFrame,
+        transferred_in_ids: Optional[set[int]] = None,
+        gameweek: int = 1,
+    ) -> tuple[list[int], BenchOrder]:
+        """
+        Select optimal starting XI and bench order based on xPts.
+
+        Args:
+            squad: Full 15-player squad.
+            player_df: Player DataFrame with projections.
+            transferred_in_ids: Set of player IDs that were transferred in (must start).
+            gameweek: Gameweek number for xPts lookup.
+
+        Returns:
+            Tuple of (starting_xi player IDs, BenchOrder).
+        """
+        if transferred_in_ids is None:
+            transferred_in_ids = set()
+
+        # Get xPts for each player
+        player_xpts = {}
+        for player in squad:
+            row = player_df[player_df["player_id"] == player.id]
+            if not row.empty:
+                row = row.iloc[0]
+                xpts_col = f"gw{gameweek}_projected"
+                xpts = float(row.get(xpts_col, 0) or row.get("gw1_projected", 0) or 0)
+                # Fallback to form if no projection
+                if xpts == 0:
+                    xpts = float(row.get("form", 0) or 0)
+                player_xpts[player.id] = xpts
+            else:
+                player_xpts[player.id] = 0.0
+
+        # Group players by position
+        by_position = {1: [], 2: [], 3: [], 4: []}  # GK, DEF, MID, FWD
+        for player in squad:
+            by_position[player.element_type].append(player)
+
+        # Sort each position by xPts (highest first)
+        for pos in by_position:
+            by_position[pos].sort(key=lambda p: player_xpts[p.id], reverse=True)
+
+        # Find best valid formation that includes all transferred-in players
+        best_xi = None
+        best_xi_xpts = -1
+
+        for formation in VALID_FORMATIONS:
+            gk_count, def_count, mid_count, fwd_count = formation
+
+            # Select top N from each position
+            xi_gks = by_position[1][:gk_count]
+            xi_defs = by_position[2][:def_count]
+            xi_mids = by_position[3][:mid_count]
+            xi_fwds = by_position[4][:fwd_count]
+
+            xi_ids = set(p.id for p in xi_gks + xi_defs + xi_mids + xi_fwds)
+
+            # Check if all transferred-in players are in starting XI
+            if not transferred_in_ids.issubset(xi_ids):
+                # Try to include transferred-in players by swapping
+                xi_candidates = xi_gks + xi_defs + xi_mids + xi_fwds
+                missing = transferred_in_ids - xi_ids
+
+                # For each missing transferred player, swap with lowest xPts player of same position
+                can_include_all = True
+                for missing_id in missing:
+                    missing_player = next((p for p in squad if p.id == missing_id), None)
+                    if missing_player is None:
+                        can_include_all = False
+                        break
+
+                    pos = missing_player.element_type
+                    pos_players_in_xi = [p for p in xi_candidates if p.element_type == pos]
+                    pos_players_not_in_xi = [p for p in by_position[pos] if p not in pos_players_in_xi]
+
+                    # Find if we can swap
+                    if missing_player in pos_players_not_in_xi:
+                        # Swap with lowest xPts player of same position
+                        lowest = min(pos_players_in_xi, key=lambda p: player_xpts[p.id])
+                        if lowest.id not in transferred_in_ids:
+                            xi_candidates.remove(lowest)
+                            xi_candidates.append(missing_player)
+                        else:
+                            can_include_all = False
+                            break
+                    else:
+                        can_include_all = False
+                        break
+
+                if not can_include_all:
+                    continue
+
+                # Verify formation is still valid
+                pos_counts = {1: 0, 2: 0, 3: 0, 4: 0}
+                for p in xi_candidates:
+                    pos_counts[p.element_type] += 1
+
+                if (pos_counts[1], pos_counts[2], pos_counts[3], pos_counts[4]) != formation:
+                    continue
+
+                xi_ids = set(p.id for p in xi_candidates)
+
+            # Calculate total xPts for this XI
+            total_xpts = sum(player_xpts[pid] for pid in xi_ids)
+
+            if total_xpts > best_xi_xpts:
+                best_xi_xpts = total_xpts
+                best_xi = list(xi_ids)
+
+        # Fallback: if no valid formation found, use first 11
+        if best_xi is None:
+            self.logger.warning("Could not find valid formation including all transfers, using default")
+            best_xi = [p.id for p in squad[:11]]
+
+        # Build bench (remaining players not in starting XI)
+        bench_players = [p for p in squad if p.id not in best_xi]
+
+        # Sort bench: GK first, then outfield by xPts descending
+        bench_gk = next((p for p in bench_players if p.element_type == 1), None)
+        bench_outfield = [p for p in bench_players if p.element_type != 1]
+        bench_outfield.sort(key=lambda p: player_xpts[p.id], reverse=True)
+
+        # Create BenchOrder
+        bench_order = BenchOrder(
+            bench_gk=bench_gk.id if bench_gk else None,
+            bench_1=bench_outfield[0].id if len(bench_outfield) > 0 else None,
+            bench_2=bench_outfield[1].id if len(bench_outfield) > 1 else None,
+            bench_3=bench_outfield[2].id if len(bench_outfield) > 2 else None,
+        )
+
+        return best_xi, bench_order
+
     def validate_formation(self, starting_xi: list[Player]) -> tuple[bool, str]:
         """
         Validate starting XI has valid formation.
@@ -1323,12 +1527,17 @@ class Optimizer:
 
         return False, f"Invalid: {formation[1]}-{formation[2]}-{formation[3]}"
 
-    def format_recommendations(self, result: OptimizationResult) -> str:
+    def format_recommendations(
+        self,
+        result: OptimizationResult,
+        player_map: Optional[dict[int, Player]] = None,
+    ) -> str:
         """
         Format optimization results for display.
 
         Args:
             result: Optimization result to format.
+            player_map: Optional mapping of player ID to Player for name lookup.
 
         Returns:
             Formatted string.
@@ -1352,6 +1561,37 @@ class Optimizer:
             lines.append(f"  Net expected gain: {result.net_expected_gain:+.2f} pts")
         else:
             lines.append("  No transfers recommended - squad is strong")
+
+        # Starting XI and Bench
+        if result.starting_xi or result.bench_order:
+            lines.append("\n[LINEUP] STARTING XI & BENCH ORDER:")
+            lines.append("-" * 70)
+
+            # Helper to get player name
+            def get_name(player_id: int) -> str:
+                if player_map and player_id in player_map:
+                    return player_map[player_id].web_name
+                # Check if player is in transfers
+                for t in result.transfers:
+                    if t.player_in.id == player_id:
+                        return t.player_in.web_name
+                return f"ID:{player_id}"
+
+            if result.starting_xi:
+                xi_names = [get_name(pid) for pid in result.starting_xi]
+                lines.append(f"  Starting XI: {', '.join(xi_names)}")
+
+            if result.bench_order:
+                bench_items = []
+                if result.bench_order.bench_gk:
+                    bench_items.append(f"GK: {get_name(result.bench_order.bench_gk)}")
+                if result.bench_order.bench_1:
+                    bench_items.append(f"1st: {get_name(result.bench_order.bench_1)}")
+                if result.bench_order.bench_2:
+                    bench_items.append(f"2nd: {get_name(result.bench_order.bench_2)}")
+                if result.bench_order.bench_3:
+                    bench_items.append(f"3rd: {get_name(result.bench_order.bench_3)}")
+                lines.append(f"  Bench Order: {', '.join(bench_items)}")
 
         # Captain
         lines.append("\n[CAPTAIN] CAPTAIN RECOMMENDATION:")

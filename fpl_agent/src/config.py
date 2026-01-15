@@ -62,8 +62,9 @@ class Config:
     max_retries: int = 3
 
     # Optimization Settings
-    max_transfers_per_week: int = 2
+    max_transfers_per_week: int = 3
     min_bank_balance: float = 0.0
+    free_transfers_override: int = 0  # Set > 0 to override API value (for dry-run mode)
 
     # Notification Settings
     notification_email: str = ""
@@ -138,8 +139,9 @@ class Config:
             api_base_url=os.getenv("API_BASE_URL", "https://fantasy.premierleague.com/api"),
             request_timeout=int(os.getenv("REQUEST_TIMEOUT", "30")),
             max_retries=int(os.getenv("MAX_RETRIES", "3")),
-            max_transfers_per_week=int(os.getenv("MAX_TRANSFERS_PER_WEEK", "2")),
+            max_transfers_per_week=int(os.getenv("MAX_TRANSFERS_PER_WEEK", "3")),
             min_bank_balance=float(os.getenv("MIN_BANK_BALANCE", "0.0")),
+            free_transfers_override=int(os.getenv("FREE_TRANSFERS_OVERRIDE", "0")),
             notification_email=os.getenv("NOTIFICATION_EMAIL", ""),
             webhook_url=os.getenv("WEBHOOK_URL", ""),
             smtp_host=os.getenv("SMTP_HOST", ""),

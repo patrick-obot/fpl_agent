@@ -493,6 +493,7 @@ class FPLClient:
         self.logger = logging.getLogger("fpl_agent.client")
         self._session: Optional[aiohttp.ClientSession] = None
         self._authenticated = False
+        self._auth_token: Optional[str] = None  # x-api-authorization token
         self._last_request_time: float = 0
 
         # Caches
@@ -601,6 +602,12 @@ class FPLClient:
         if not url.startswith("http"):
             url = f"{self.BASE_URL}/{url.lstrip('/')}"
 
+        # Add x-api-authorization header if we have a token
+        if self._auth_token:
+            headers = kwargs.get("headers", {})
+            headers["x-api-authorization"] = self._auth_token
+            kwargs["headers"] = headers
+
         # Rate limiting - strict 1 request per second
         async with self._rate_limiter:
             # Additional time-based rate limiting
@@ -690,7 +697,7 @@ class FPLClient:
         """
         Authenticate with FPL using credentials from config.
 
-        Establishes a session that maintains authentication cookies.
+        Uses Playwright browser automation to capture x-api-authorization token.
 
         Returns:
             True if authentication successful.
@@ -703,20 +710,126 @@ class FPLClient:
             self._authenticated = True
             return True
 
+        # Check for pre-set token
+        import os
+        fpl_token = os.getenv("FPL_TOKEN", "")
+        if fpl_token:
+            self.logger.info("Using FPL_TOKEN for authentication...")
+            self._auth_token = fpl_token
+            self._authenticated = True
+            self.logger.info("Authentication via token successful")
+            return True
+
         if not self.config.fpl_email or not self.config.fpl_password:
             raise AuthenticationError("Email and password required for authentication")
 
-        self.logger.info(f"Authenticating as {self.config.fpl_email}...")
+        # Use Playwright to get token
+        self.logger.info(f"Authenticating via Playwright as {self.config.fpl_email}...")
+        token = await self._get_token_via_playwright()
+        if token:
+            self._auth_token = token
+            self._authenticated = True
+            self.logger.info("Authentication successful (token captured)")
+            return True
+
+        raise AuthenticationError("Failed to capture authentication token via Playwright")
+
+    async def _get_token_via_playwright(self) -> Optional[str]:
+        """Extract FPL authentication token using Playwright browser automation."""
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            self.logger.error("Playwright not installed. Run: pip install playwright && playwright install chromium")
+            raise AuthenticationError("Playwright not installed")
+
+        token_holder = {"token": None}
+
+        def on_request(request):
+            url = request.url
+            if "fantasy.premierleague.com" in url and "/api/" in url:
+                auth = request.headers.get("x-api-authorization")
+                if auth and not token_holder["token"]:
+                    token_holder["token"] = auth
+                    self.logger.debug(f"Token captured from: {url}")
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context()
+            context.on("request", on_request)
+            page = await context.new_page()
+
+            try:
+                self.logger.debug("Opening FPL homepage...")
+                await page.goto("https://fantasy.premierleague.com/", wait_until="domcontentloaded", timeout=60000)
+
+                # Accept cookies if present
+                try:
+                    await page.get_by_role("button", name="Accept All Cookies").click(timeout=5000)
+                except:
+                    pass
+
+                # Go to login page
+                login_page = page
+                try:
+                    async with context.expect_page() as new_page_info:
+                        await page.get_by_role("button", name="Log in").click(timeout=10000)
+                    login_page = await new_page_info.value
+                except:
+                    login_page = page
+
+                # Fill credentials
+                await login_page.wait_for_selector('input[placeholder="Email address"]', timeout=20000)
+                await login_page.get_by_placeholder("Email address").fill(self.config.fpl_email)
+                await login_page.get_by_placeholder("Password").fill(self.config.fpl_password)
+                await login_page.locator("#btnSignIn").click()
+
+                self.logger.debug("Waiting for login to complete...")
+                await login_page.wait_for_timeout(3000)
+
+                # Activate FPL session
+                try:
+                    await login_page.wait_for_url("**/fantasy.premierleague.com/**", timeout=10000)
+                    try:
+                        await login_page.get_by_role("button", name="Log in").click(timeout=5000)
+                    except:
+                        pass
+                    await login_page.wait_for_timeout(3000)
+                except:
+                    pass
+
+                # Go to My Team to trigger API calls
+                self.logger.debug("Navigating to My Team...")
+                await page.goto("https://fantasy.premierleague.com/my-team", wait_until="networkidle", timeout=60000)
+
+                # Wait for token to be captured
+                for _ in range(20):
+                    if token_holder["token"]:
+                        break
+                    await page.wait_for_timeout(1000)
+
+            finally:
+                await browser.close()
+
+        return token_holder["token"]
+
+    async def _login_legacy(self) -> bool:
+        """Legacy login method using direct API (fallback)."""
+        self.logger.info(f"Trying legacy login as {self.config.fpl_email}...")
 
         if self._session is None:
             await self.connect()
 
-        # Prepare login payload
+        # Prepare login payload (matching fpl library format)
         payload = {
             "login": self.config.fpl_email,
             "password": self.config.fpl_password,
-            "redirect_uri": "https://fantasy.premierleague.com/",
+            "redirect_uri": "https://fantasy.premierleague.com/a/login",
             "app": "plfpl-web",
+        }
+
+        # Use Android User-Agent for login (better success rate)
+        login_headers = {
+            "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 5.1; PRO 5 Build/LMY47D)",
         }
 
         try:
@@ -725,36 +838,66 @@ class FPLClient:
                 async with self._session.post(
                     self.LOGIN_URL,
                     data=payload,
+                    headers=login_headers,
                     allow_redirects=False
                 ) as response:
 
                     self.logger.debug(f"Login response status: {response.status}")
+                    self.logger.debug(f"Login response headers: {dict(response.headers)}")
+
+                    # Check for redirect issues
+                    if response.status == 302:
+                        location = response.headers.get("Location", "")
+
+                        # Check for holding page (service unavailable)
+                        if "holding.html" in location:
+                            raise AuthenticationError(
+                                "FPL login service temporarily unavailable (holding page). "
+                                "Try again later or use FPL_COOKIE from your browser."
+                            )
+
+                        # Check for state=fail in URL
+                        if "state=fail" in location:
+                            import urllib.parse
+                            parsed = urllib.parse.urlparse(location)
+                            params = urllib.parse.parse_qs(parsed.query)
+                            reason = params.get("reason", ["Unknown"])[0]
+                            raise AuthenticationError(f"Login failed: {reason}")
 
                     # Check for successful login (redirect or 200)
                     if response.status in (200, 302):
-                        # Verify we got session cookies
-                        cookies = self._session.cookie_jar.filter_cookies(self.BASE_URL)
+                        # Check cookies from both domains
+                        fpl_cookies = self._session.cookie_jar.filter_cookies(self.BASE_URL)
+                        users_cookies = self._session.cookie_jar.filter_cookies("https://users.premierleague.com/")
 
-                        if cookies:
+                        self.logger.debug(f"FPL cookies: {dict(fpl_cookies)}")
+                        self.logger.debug(f"Users cookies: {dict(users_cookies)}")
+
+                        if fpl_cookies or users_cookies:
                             self._authenticated = True
                             self.logger.info("Authentication successful")
                             return True
                         else:
-                            # Try to detect login failure from response
+                            # Try to detect login failure from response body
                             try:
                                 text = await response.text()
                                 if "incorrect" in text.lower() or "invalid" in text.lower():
                                     raise AuthenticationError("Invalid email or password")
+                            except AuthenticationError:
+                                raise
                             except:
                                 pass
 
-                            # Assume success if we got 200/302
+                            # Even without visible cookies, the session may work
                             self._authenticated = True
-                            self.logger.info("Authentication successful (no cookies visible)")
+                            self.logger.info("Authentication successful (session-based)")
                             return True
 
                     elif response.status == 400:
-                        raise AuthenticationError("Invalid credentials")
+                        raise AuthenticationError("Invalid credentials (400)")
+
+                    elif response.status == 403:
+                        raise AuthenticationError("Access forbidden (403) - credentials may be incorrect")
 
                     else:
                         text = await response.text()
@@ -1059,8 +1202,12 @@ class FPLClient:
         transfers_made = current_history.get("event_transfers", 0) if current_history else 0
 
         # Determine free transfers (default 1-2, max 5 with rollover)
-        # This is an approximation since we can't see exact free transfers from public API
-        free_transfers = max(1, 2 - transfers_made)
+        # Use config override if set, otherwise approximate from API
+        if self.config.free_transfers_override > 0:
+            free_transfers = self.config.free_transfers_override
+        else:
+            # Approximation since public API doesn't expose exact free transfers
+            free_transfers = max(1, 2 - transfers_made)
 
         # Check chip usage from history
         chips_used = set()
