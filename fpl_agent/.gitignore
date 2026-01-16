@@ -44,6 +44,7 @@ logs/
 
 # Data files (keep structure, ignore contents)
 data/*.csv
+!data/projected_points.csv
 !data/.gitkeep
 
 # Testing
