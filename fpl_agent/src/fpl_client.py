@@ -1316,11 +1316,23 @@ class FPLClient:
         # Get current gameweek
         gw = await self.get_current_gameweek()
 
-        # Build transfer payload
-        transfer_data = [
-            {"element_in": t.element_in, "element_out": t.element_out}
-            for t in transfers
-        ]
+        # Get current team to find selling prices (stored in pounds, e.g., 6.5)
+        my_team = await self.get_my_team()
+        selling_prices = {p.element: p.selling_price for p in my_team.picks}
+
+        # Get all players to find purchase prices (now_cost already in pounds, e.g., 6.5)
+        players = await self.get_players()
+        purchase_prices = {p.id: p.now_cost for p in players}
+
+        # Build transfer payload with prices (API expects tenths, e.g., 65 for £6.5m)
+        transfer_data = []
+        for t in transfers:
+            transfer_data.append({
+                "element_in": t.element_in,
+                "element_out": t.element_out,
+                "purchase_price": round(purchase_prices.get(t.element_in, 0) * 10),
+                "selling_price": round(selling_prices.get(t.element_out, 0) * 10),
+            })
 
         # Determine chip
         chip = None

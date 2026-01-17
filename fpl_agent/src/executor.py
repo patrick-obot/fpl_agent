@@ -1266,8 +1266,8 @@ class Executor:
         transfers = []
         for t in plan.transfers:
             transfers.append(Transfer(
-                player_in_id=t.player_in_id,
-                player_out_id=t.player_out_id,
+                element_in=t.player_in_id,
+                element_out=t.player_out_id,
             ))
             self.logger.info(f"Preparing: {t.player_out_name} -> {t.player_in_name}")
 
