@@ -18,6 +18,9 @@ def setup_logging(log_level: str, log_file: Optional[Path] = None) -> logging.Lo
     logger = logging.getLogger("fpl_agent")
     logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
 
+    # Remove existing handlers to prevent duplicates on repeated calls
+    logger.handlers.clear()
+
     # Console handler
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.DEBUG)
