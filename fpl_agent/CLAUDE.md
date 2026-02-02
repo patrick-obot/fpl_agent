@@ -68,6 +68,7 @@ Checks every 5 minutes. Tracks `last_*` dates to avoid duplicate runs.
 - **Container**: Playwright Python base image (for auth)
 - **Config**: `railway.toml`, `Dockerfile`, `.railwayignore`
 - Push to `master` -> Railway auto-builds and deploys
+- **Railway CLI**: Linked to service `fpl-agent` in `production` environment
 
 ## Environment Variables (in Railway)
 
@@ -76,15 +77,11 @@ SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, NOTIFICATION_EMAIL
 
 ## Current Status (Feb 2, 2026)
 
-- **GW24**: Completed (deadline was Jan 31 13:30 UTC)
-- **Bugs fixed**: Stale price cache, captain never set, approval blocking on Railway
+- **GW24**: Deadline was Jan 31 13:30 UTC. Agent ran but old `require_approval=True` blocked execution.
 - **Mode**: Autonomous (`confirm=True`, no human approval needed)
 - **Projections loaded**: GW25-34
 - **Next action**: Agent will auto-execute at ~2h before GW25 deadline
-
-## Known Issues
-
-- **Duplicate logging**: Every log line appears ~20x on Railway, hitting 500 logs/sec rate limit. Likely duplicate handler attachment. Not blocking but wastes log quota.
+- **Logging fix deployed**: Awaiting verification at next 01:30 UTC price check (Feb 3)
 
 ## Testing
 
@@ -100,3 +97,33 @@ pytest tests/ -v --cov=src      # With coverage
 - `ExecutionPlan.gameweek` tracks which GW each plan/execution belongs to
 - Executor stores gameweek in audit trail details and plan JSON files
 - FPL auth uses Playwright browser automation (headless Chromium)
+
+---
+
+## Change Log
+
+### Feb 2, 2026 - Session 1: Bug fixes + autonomous mode + logging fix
+
+**Commit `2027dfa`**: Fix 3 execution bugs, add gameweek tracking, enable autonomous mode
+
+Three bugs that prevented the agent from ever successfully executing a transfer:
+
+1. **Stale price cache** (`src/fpl_client.py:1324`): `make_transfers()` used `get_players()` which returned 5-min cached prices. FPL API rejected transfers with 400 "Purchase price changed". Fixed by using `get_players(force_refresh=True)`.
+
+2. **Captain never set** (`src/executor.py:1297-1300`): `_execute_captain()` called `client.set_captain()` without `confirm=True`. The method returned early with a fake success without making the API call. Fixed by adding `confirm=True`.
+
+3. **Scheduler blocked on approval** (`main.py:522`): Final execution used `require_approval=True`, which waited for a CLI `approve` command impossible on Railway. Fixed by switching to `confirm=True`.
+
+Also added:
+- `gameweek` field to `ExecutionPlan` dataclass (set from team state before execution)
+- Gameweek included in plan JSON files (`data/plans/*.json`) and audit trail entries
+- `railway.toml` comment updated to "(autonomous execution)"
+
+**Commit `2483104`**: Fix duplicate logging + add CLAUDE.md
+
+- **Root cause**: `setup_logging()` in `src/config.py` added `StreamHandler`/`FileHandler` to the `fpl_agent` logger every time `Config` was instantiated. Since `logging.getLogger()` returns a singleton, handlers accumulated across scheduler cycles (~20 handlers = ~20x duplicate lines), hitting Railway's 500 logs/sec rate limit.
+- **Fix**: Added `logger.handlers.clear()` at top of `setup_logging()` before adding new handlers. Now idempotent regardless of how many times it's called.
+
+### Bugs from GW22-24 (Jan 17 - Jan 31)
+
+All 3 execution attempts on Jan 17 (GW22) failed due to the stale price cache bug. Agent has been idle since, running only price checks and preparation runs. The approval timeout bug prevented GW24 execution on Jan 31 even though the pipeline ran successfully up to the execution step (logs showed "Approval requested. Deadline: 2026-01-31 13:00").
