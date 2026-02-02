@@ -519,7 +519,7 @@ async def run_scheduler() -> None:
                             mode='live',
                             notify='email',
                             deadline_hours=FINAL_EXECUTION_HOURS,
-                            require_approval=True
+                            confirm=True
                         )
                         last_execution = exec_date
 

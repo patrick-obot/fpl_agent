@@ -159,6 +159,7 @@ class ExecutionPlan:
     net_expected_gain: float = 0.0
     overall_confidence: float = 0.0
     alerts: list[Alert] = field(default_factory=list)
+    gameweek: Optional[int] = None
     team_state_before: Optional[TeamState] = None
     team_state_after: Optional[TeamState] = None
     error_message: Optional[str] = None
@@ -858,6 +859,8 @@ class Executor:
         plan.team_state_before = await self.state_manager.save_state(
             self.client, label="dry_run"
         )
+        if plan.team_state_before:
+            plan.gameweek = plan.team_state_before.gameweek
 
         # Log the plan details
         self.logger.info("=" * 70)
@@ -883,6 +886,7 @@ class Executor:
             action="DRY_RUN",
             plan_id=plan.id,
             details={
+                "gameweek": plan.gameweek,
                 "transfers": len(plan.transfers),
                 "net_gain": plan.net_expected_gain,
                 "alerts": len(plan.alerts),
@@ -1202,6 +1206,8 @@ class Executor:
             self.client, label=f"before_{plan.id}"
         )
         result.rollback_available = plan.team_state_before is not None
+        if plan.team_state_before:
+            plan.gameweek = plan.team_state_before.gameweek
 
         plan.status = ExecutionStatus.EXECUTING
         self.logger.info(f"Executing plan {plan.id}")
@@ -1245,6 +1251,7 @@ class Executor:
             action="EXECUTED",
             plan_id=plan.id,
             details={
+                "gameweek": plan.gameweek,
                 "transfers_executed": result.transfers_executed,
                 "captain_set": result.captain_set,
                 "success": result.success,
@@ -1297,6 +1304,7 @@ class Executor:
             response = await self.client.set_captain(
                 captain_id=cap.captain_id,
                 vice_captain_id=cap.vice_captain_id,
+                confirm=True,
             )
 
             if response.get("success") or response.get("status") == "dry_run":
@@ -1390,6 +1398,7 @@ class Executor:
 
         data = {
             "id": plan.id,
+            "gameweek": plan.gameweek,
             "status": plan.status.value,
             "created_at": plan.created_at.isoformat(),
             "approved_at": plan.approved_at.isoformat() if plan.approved_at else None,
@@ -1456,6 +1465,7 @@ class Executor:
             if data.get("captain"):
                 plan.captain = CaptainDecision(**data["captain"])
 
+            plan.gameweek = data.get("gameweek")
             plan.net_expected_gain = data.get("net_expected_gain", 0)
             plan.overall_confidence = data.get("overall_confidence", 0)
             plan.approved_by = data.get("approved_by")

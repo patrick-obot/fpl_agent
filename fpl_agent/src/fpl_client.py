@@ -1321,7 +1321,7 @@ class FPLClient:
         selling_prices = {p.element: p.selling_price for p in my_team.picks}
 
         # Get all players to find purchase prices (now_cost already in pounds, e.g., 6.5)
-        players = await self.get_players()
+        players = await self.get_players(force_refresh=True)
         purchase_prices = {p.id: p.now_cost for p in players}
 
         # Build transfer payload with prices (API expects tenths, e.g., 65 for £6.5m)

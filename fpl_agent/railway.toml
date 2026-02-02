@@ -14,7 +14,7 @@ numReplicas = 1
 # The scheduler handles all scheduling internally:
 # - Daily price check at 01:30 UTC
 # - Preparation run 48h before deadline (analysis only)
-# - Final execution 2h before deadline (with human approval required)
+# - Final execution 2h before deadline (autonomous execution)
 startCommand = "python main.py schedule"
 
 # Restart policy - always restart to keep scheduler running
