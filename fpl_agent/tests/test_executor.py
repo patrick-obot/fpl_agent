@@ -206,6 +206,15 @@ class MockCaptainChoice:
         self.reason = "Test captain reason"
 
 
+class MockBenchOrder:
+    """Mock bench order."""
+    def __init__(self, player_ids: list = None):
+        self._ids = player_ids or []
+
+    def to_list(self) -> list[int]:
+        return self._ids
+
+
 class MockOptimizationResult:
     """Mock optimization result."""
     def __init__(
@@ -213,10 +222,14 @@ class MockOptimizationResult:
         transfers: list = None,
         captain: MockCaptainChoice = None,
         vice_captain: MockCaptainChoice = None,
+        starting_xi: list = None,
+        bench_order: MockBenchOrder = None,
     ):
         self.transfers = transfers or []
         self.captain = captain
         self.vice_captain = vice_captain
+        self.starting_xi = starting_xi or []
+        self.bench_order = bench_order
 
 
 # =============================================================================

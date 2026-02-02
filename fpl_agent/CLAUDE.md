@@ -41,7 +41,7 @@ Checks every 5 minutes. Tracks `last_*` dates to avoid duplicate runs.
 2. Collect data (FPL API + projected_points.csv)
 3. Optimize (transfers, captain, chips)
 4. Build ExecutionPlan with alerts
-5. Execute transfers + set captain via API
+5. Execute transfers + set lineup/captain/bench order via single API call
 6. Log audit trail, save state snapshots, send email notification
 
 ## Safety Layers
@@ -101,6 +101,16 @@ pytest tests/ -v --cov=src      # With coverage
 ---
 
 ## Change Log
+
+### Feb 3, 2026 - Session 2: Set lineup + bench order after transfers
+
+- **Problem**: Optimizer calculated `starting_xi` and `bench_order` but they were never sent to the FPL API. Transferred-in players landed on the bench by default.
+- **Fix**: Added `set_lineup()` to `FPLClient` (`src/fpl_client.py`) that POSTs starting XI (positions 1-11), bench order (positions 12-15), captain, and vice-captain in a single API call to `my-team/{team_id}/`.
+- Added `starting_xi` and `bench_order` fields to `ExecutionPlan`, `lineup_set` to `ExecutionResult`.
+- New `_execute_lineup()` method in executor replaces direct `_execute_captain()` call during plan execution. Falls back to `_execute_captain()` if no lineup data present.
+- Plan JSON files and audit trail now include lineup data.
+- Dry run display shows planned starting XI and bench order.
+- `set_captain()` kept as-is for standalone/backward-compat use.
 
 ### Feb 2, 2026 - Session 1: Bug fixes + autonomous mode + logging fix
 

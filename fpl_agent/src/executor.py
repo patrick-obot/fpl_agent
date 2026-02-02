@@ -158,6 +158,8 @@ class ExecutionPlan:
     total_hit_cost: int = 0
     net_expected_gain: float = 0.0
     overall_confidence: float = 0.0
+    starting_xi: list[int] = field(default_factory=list)
+    bench_order: list[int] = field(default_factory=list)
     alerts: list[Alert] = field(default_factory=list)
     gameweek: Optional[int] = None
     team_state_before: Optional[TeamState] = None
@@ -172,6 +174,7 @@ class ExecutionResult:
     plan: ExecutionPlan
     transfers_executed: int = 0
     captain_set: bool = False
+    lineup_set: bool = False
     success: bool = False
     messages: list[str] = field(default_factory=list)
     rollback_available: bool = False
@@ -719,6 +722,10 @@ class Executor:
                 reason=cap.reason,
             )
 
+        # Copy lineup data
+        plan.starting_xi = optimization_result.starting_xi or []
+        plan.bench_order = optimization_result.bench_order.to_list() if optimization_result.bench_order else []
+
         # Calculate totals
         plan.total_expected_gain = sum(t.expected_gain for t in plan.transfers)
         plan.total_hit_cost = sum(t.hit_cost for t in plan.transfers)
@@ -929,7 +936,42 @@ class Executor:
             lines.append(f"CAPTAIN: {plan.captain.captain_name}")
             lines.append(f"         Expected: {plan.captain.expected_points:.1f} pts")
 
+        if plan.starting_xi:
+            lines.append("")
+            lines.append(f"STARTING XI ({len(plan.starting_xi)} players):")
+            for pid in plan.starting_xi:
+                name = self._resolve_player_name(pid, plan)
+                lines.append(f"  {name}")
+
+        if plan.bench_order:
+            lines.append(f"BENCH ORDER ({len(plan.bench_order)} players):")
+            for idx, pid in enumerate(plan.bench_order):
+                name = self._resolve_player_name(pid, plan)
+                label = "GK" if idx == 0 else f"{idx}"
+                lines.append(f"  {label}: {name}")
+
         return "\n".join(lines)
+
+    def _resolve_player_name(self, player_id: int, plan: ExecutionPlan) -> str:
+        """Resolve player ID to name using plan transfer data or team state."""
+        # Check transfers (in/out names)
+        for t in plan.transfers:
+            if t.player_in_id == player_id:
+                return t.player_in_name
+            if t.player_out_id == player_id:
+                return t.player_out_name
+        # Check captain
+        if plan.captain:
+            if plan.captain.captain_id == player_id:
+                return plan.captain.captain_name
+            if plan.captain.vice_captain_id == player_id:
+                return plan.captain.vice_captain_name
+        # Check team state
+        if plan.team_state_before:
+            for pick in plan.team_state_before.picks:
+                if pick.get("element") == player_id:
+                    return pick.get("web_name", str(player_id))
+        return str(player_id)
 
     def _analyze_expected_points(self, plan: ExecutionPlan) -> str:
         """Analyze expected points impact."""
@@ -1217,9 +1259,9 @@ class Executor:
             if plan.transfers:
                 await self._execute_transfers(plan, result)
 
-            # Execute captain change
-            if plan.captain:
-                await self._execute_captain(plan, result)
+            # Execute lineup + captain change
+            if plan.starting_xi or plan.captain:
+                await self._execute_lineup(plan, result)
 
             # Save state after execution
             plan.team_state_after = await self.state_manager.save_state(
@@ -1229,6 +1271,7 @@ class Executor:
             # Determine success
             result.success = (
                 result.transfers_executed == len(plan.transfers) and
+                (not plan.starting_xi or result.lineup_set) and
                 (plan.captain is None or result.captain_set)
             )
 
@@ -1253,6 +1296,7 @@ class Executor:
             details={
                 "gameweek": plan.gameweek,
                 "transfers_executed": result.transfers_executed,
+                "lineup_set": result.lineup_set,
                 "captain_set": result.captain_set,
                 "success": result.success,
             },
@@ -1316,6 +1360,55 @@ class Executor:
         except Exception as e:
             result.messages.append(f"Captain API error: {e}")
             raise
+
+    async def _execute_lineup(self, plan: ExecutionPlan, result: ExecutionResult) -> None:
+        """Execute lineup, bench order, and captain change from plan."""
+        captain_id = plan.captain.captain_id if plan.captain else None
+        vice_captain_id = plan.captain.vice_captain_id if plan.captain else None
+
+        if plan.starting_xi and plan.bench_order:
+            self.logger.info(
+                f"Setting lineup: {len(plan.starting_xi)} starters, "
+                f"{len(plan.bench_order)} bench"
+            )
+
+            if not captain_id:
+                # No captain decision — fall back to current captain
+                team = await self.client.get_my_team()
+                for pick in team.picks:
+                    if pick.is_captain:
+                        captain_id = pick.element
+                    if pick.is_vice_captain:
+                        vice_captain_id = pick.element
+
+            try:
+                response = await self.client.set_lineup(
+                    starting_xi=plan.starting_xi,
+                    bench_order=plan.bench_order,
+                    captain_id=captain_id,
+                    vice_captain_id=vice_captain_id,
+                    confirm=True,
+                )
+
+                if response.get("success"):
+                    result.lineup_set = True
+                    result.captain_set = True
+                    result.messages.append(
+                        f"Lineup set: {len(plan.starting_xi)} starters, "
+                        f"{len(plan.bench_order)} bench"
+                    )
+                    if plan.captain:
+                        result.messages.append(f"Captain set to {plan.captain.captain_name}")
+                else:
+                    result.messages.append(f"Lineup error: {response}")
+
+            except Exception as e:
+                result.messages.append(f"Lineup API error: {e}")
+                raise
+
+        elif plan.captain:
+            # No lineup data but captain decision exists — use set_captain directly
+            await self._execute_captain(plan, result)
 
     # -------------------------------------------------------------------------
     # Rollback
@@ -1427,6 +1520,8 @@ class Executor:
                 "confidence": plan.captain.confidence,
                 "reason": plan.captain.reason,
             } if plan.captain else None,
+            "starting_xi": plan.starting_xi,
+            "bench_order": plan.bench_order,
             "net_expected_gain": plan.net_expected_gain,
             "overall_confidence": plan.overall_confidence,
             "approved_by": plan.approved_by,
@@ -1465,6 +1560,8 @@ class Executor:
             if data.get("captain"):
                 plan.captain = CaptainDecision(**data["captain"])
 
+            plan.starting_xi = data.get("starting_xi", [])
+            plan.bench_order = data.get("bench_order", [])
             plan.gameweek = data.get("gameweek")
             plan.net_expected_gain = data.get("net_expected_gain", 0)
             plan.overall_confidence = data.get("overall_confidence", 0)

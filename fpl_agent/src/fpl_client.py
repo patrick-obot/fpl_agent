@@ -1450,6 +1450,101 @@ class FPLClient:
             "message": "Captain updated successfully"
         }
 
+    async def set_lineup(
+        self,
+        starting_xi: list[int],
+        bench_order: list[int],
+        captain_id: int,
+        vice_captain_id: int,
+        confirm: bool = False,
+    ) -> dict:
+        """
+        Set starting lineup, bench order, captain, and vice-captain in one call.
+
+        Args:
+            starting_xi: List of 11 player element IDs for the starting XI.
+            bench_order: List of 4 player element IDs for bench (GK first, then by xPts).
+            captain_id: Element ID of the captain.
+            vice_captain_id: Element ID of the vice-captain.
+            confirm: If True, actually execute.
+
+        Returns:
+            Result dictionary.
+        """
+        if self.config.dry_run:
+            self.logger.info(
+                f"Dry run mode - would set lineup: {len(starting_xi)} starters, "
+                f"{len(bench_order)} bench, captain={captain_id}"
+            )
+            return {
+                "success": True,
+                "captain": captain_id,
+                "vice_captain": vice_captain_id,
+                "starting_xi": starting_xi,
+                "bench_order": bench_order,
+                "message": "[DRY RUN] Lineup changes not applied",
+            }
+
+        await self.ensure_authenticated()
+
+        if not confirm:
+            return {
+                "success": True,
+                "captain": captain_id,
+                "vice_captain": vice_captain_id,
+                "starting_xi": starting_xi,
+                "bench_order": bench_order,
+                "message": "Ready to set lineup. Call with confirm=True to proceed.",
+            }
+
+        # Get current team to build picks payload
+        team = await self.get_my_team()
+
+        # Build a map of element -> current pick data for selling/purchase prices
+        current_picks = {pick.element: pick for pick in team.picks}
+
+        picks = []
+        # Starting XI: positions 1-11
+        for idx, player_id in enumerate(starting_xi, start=1):
+            is_cap = player_id == captain_id
+            picks.append({
+                "element": player_id,
+                "position": idx,
+                "is_captain": is_cap,
+                "is_vice_captain": player_id == vice_captain_id,
+                "multiplier": 2 if is_cap else 1,
+            })
+
+        # Bench: positions 12-15
+        for idx, player_id in enumerate(bench_order, start=12):
+            picks.append({
+                "element": player_id,
+                "position": idx,
+                "is_captain": player_id == captain_id,
+                "is_vice_captain": player_id == vice_captain_id,
+                "multiplier": 0,
+            })
+
+        response = await self._request(
+            "POST",
+            f"my-team/{self.config.fpl_team_id}/",
+            json={"picks": picks},
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.logger.info(
+            f"Lineup set: {len(starting_xi)} starters, {len(bench_order)} bench, "
+            f"captain={captain_id}"
+        )
+        return {
+            "success": True,
+            "captain": captain_id,
+            "vice_captain": vice_captain_id,
+            "starting_xi": starting_xi,
+            "bench_order": bench_order,
+            "message": "Lineup updated successfully",
+        }
+
     # -------------------------------------------------------------------------
     # Mock Data for Dry Run
     # -------------------------------------------------------------------------
