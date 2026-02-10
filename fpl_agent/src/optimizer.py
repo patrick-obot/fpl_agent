@@ -176,7 +176,7 @@ class TransferOptimizer:
         player_df: pd.DataFrame,
         budget: float,
         free_transfers: int,
-        max_transfers: int = 2,
+        max_transfers: int = 5,
         planning_horizon: int = 5,
     ):
         """
@@ -187,7 +187,7 @@ class TransferOptimizer:
             player_df: DataFrame with all player data and projections.
             budget: Available budget in millions.
             free_transfers: Number of free transfers available.
-            max_transfers: Maximum transfers to recommend.
+            max_transfers: Maximum transfers to recommend (default 5).
             planning_horizon: Number of gameweeks to consider.
         """
         self.current_squad = current_squad
@@ -1463,7 +1463,7 @@ class Optimizer:
                 player_df=player_df,
                 budget=bank,
                 free_transfers=free_transfers,
-                max_transfers=free_transfers + 2,  # Buffer for injury hits
+                max_transfers=free_transfers + 4,  # Buffer for injury hits (max 5 total)
             )
             result.transfers = transfer_optimizer.optimize()
 
@@ -1550,7 +1550,7 @@ class Optimizer:
         player_df: pd.DataFrame,
         budget: float,
         free_transfers: int,
-        max_transfers: int = 2,
+        max_transfers: int = 5,
     ) -> list[TransferRecommendation]:
         """
         Optimize transfers without API calls (for testing).
@@ -1560,7 +1560,7 @@ class Optimizer:
             player_df: Player DataFrame.
             budget: Available budget.
             free_transfers: Free transfers available.
-            max_transfers: Maximum transfers to make.
+            max_transfers: Maximum transfers to make (default 5).
 
         Returns:
             List of TransferRecommendation objects.
