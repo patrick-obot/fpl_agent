@@ -229,13 +229,24 @@ class NotificationService:
         """
         subject = f"FPL Agent - Approval Required (Deadline: {deadline.strftime('%H:%M')})"
         body = self._format_approval_email(plan, deadline)
+        sent = False
 
-        # Try email first
+        # Try Telegram first (preferred)
+        if self.config.telegram_bot_token and self.config.telegram_chat_id:
+            try:
+                telegram_msg = self._format_telegram_approval(plan, deadline)
+                await self._send_telegram(telegram_msg)
+                self.logger.info("Approval request sent via Telegram")
+                sent = True
+            except Exception as e:
+                self.logger.warning(f"Telegram notification failed: {e}")
+
+        # Try email
         if self.config.notification_email:
             try:
                 await self._send_email(subject, body)
                 self.logger.info(f"Approval request sent to {self.config.notification_email}")
-                return True
+                sent = True
             except Exception as e:
                 self.logger.warning(f"Email notification failed: {e}")
 
@@ -244,11 +255,11 @@ class NotificationService:
             try:
                 await self._send_webhook(plan, deadline)
                 self.logger.info("Approval request sent via webhook")
-                return True
+                sent = True
             except Exception as e:
                 self.logger.warning(f"Webhook notification failed: {e}")
 
-        return False
+        return sent
 
     async def send_execution_result(
         self,
@@ -258,15 +269,28 @@ class NotificationService:
         status = "SUCCESS" if result.success else "FAILED"
         subject = f"FPL Agent - Execution {status}"
         body = self._format_result_email(result)
+        sent = False
 
+        # Try Telegram first (preferred)
+        if self.config.telegram_bot_token and self.config.telegram_chat_id:
+            try:
+                telegram_msg = self._format_telegram_result(result)
+                await self._send_telegram(telegram_msg)
+                self.logger.info("Result notification sent via Telegram")
+                sent = True
+            except Exception as e:
+                self.logger.warning(f"Telegram notification failed: {e}")
+
+        # Try email as fallback
         if self.config.notification_email:
             try:
                 await self._send_email(subject, body)
-                return True
+                self.logger.info(f"Result notification sent to {self.config.notification_email}")
+                sent = True
             except Exception as e:
-                self.logger.warning(f"Result notification failed: {e}")
+                self.logger.warning(f"Email notification failed: {e}")
 
-        return False
+        return sent
 
     async def _send_email(self, subject: str, body: str) -> None:
         """Send email notification."""
@@ -326,6 +350,26 @@ class NotificationService:
             ) as response:
                 if response.status not in (200, 204):
                     raise Exception(f"Webhook returned {response.status}")
+
+    async def _send_telegram(self, message: str) -> None:
+        """Send Telegram notification."""
+        import aiohttp
+
+        if not self.config.telegram_bot_token or not self.config.telegram_chat_id:
+            raise ValueError("Telegram configuration incomplete")
+
+        url = f"https://api.telegram.org/bot{self.config.telegram_bot_token}/sendMessage"
+        payload = {
+            "chat_id": self.config.telegram_chat_id,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=30) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    raise Exception(f"Telegram API returned {response.status}: {error_text}")
 
     def _format_approval_email(self, plan: ExecutionPlan, deadline: datetime) -> str:
         """Format approval request email body."""
@@ -409,6 +453,86 @@ class NotificationService:
 
         for msg in result.messages:
             lines.append(f"  - {msg}")
+
+        return "\n".join(lines)
+
+    def _format_telegram_result(self, result: ExecutionResult) -> str:
+        """Format execution result for Telegram."""
+        status = "✅ SUCCESS" if result.success else "❌ FAILED"
+        plan = result.plan
+
+        lines = [
+            f"<b>FPL Agent - {status}</b>",
+            "",
+        ]
+
+        # Transfers
+        if plan.transfers:
+            lines.append("<b>Transfers:</b>")
+            for t in plan.transfers:
+                hit_str = f" (-{abs(t.hit_cost)})" if t.hit_cost < 0 else ""
+                lines.append(f"  🔄 {t.player_out_name} ➡️ {t.player_in_name}{hit_str}")
+        else:
+            lines.append("No transfers made")
+
+        # Captain
+        if plan.captain:
+            lines.append(f"\n<b>Captain:</b> {plan.captain.captain_name} (C)")
+            lines.append(f"<b>Vice:</b> {plan.captain.vice_captain_name} (V)")
+
+        # Lineup
+        if result.lineup_set:
+            lines.append("\n✅ Lineup set")
+
+        # Summary
+        lines.extend([
+            "",
+            f"<b>Net Gain:</b> {plan.net_expected_gain:.1f} pts",
+            f"<b>Executed:</b> {result.transfers_executed}/{len(plan.transfers)} transfers",
+        ])
+
+        # Messages
+        if result.messages:
+            lines.append("\n<b>Details:</b>")
+            for msg in result.messages[:5]:  # Limit to 5 messages
+                lines.append(f"  • {msg}")
+
+        return "\n".join(lines)
+
+    def _format_telegram_approval(self, plan: ExecutionPlan, deadline: datetime) -> str:
+        """Format approval request for Telegram."""
+        lines = [
+            "<b>⚠️ FPL Agent - Approval Required</b>",
+            f"<b>Deadline:</b> {deadline.strftime('%Y-%m-%d %H:%M')}",
+            "",
+        ]
+
+        # Transfers
+        if plan.transfers:
+            lines.append("<b>Proposed Transfers:</b>")
+            for t in plan.transfers:
+                hit_str = f" (-{abs(t.hit_cost)})" if t.hit_cost < 0 else ""
+                lines.append(f"  🔄 {t.player_out_name} ➡️ {t.player_in_name}{hit_str}")
+                lines.append(f"     +{t.net_gain:.1f} pts | {t.reason}")
+        else:
+            lines.append("No transfers proposed")
+
+        # Captain
+        if plan.captain:
+            lines.append(f"\n<b>Captain:</b> {plan.captain.captain_name}")
+
+        # Summary
+        lines.extend([
+            "",
+            f"<b>Expected Gain:</b> +{plan.net_expected_gain:.1f} pts",
+            f"<b>Confidence:</b> {plan.overall_confidence:.0%}",
+        ])
+
+        # Alerts
+        if plan.alerts:
+            lines.append("\n<b>⚠️ Alerts:</b>")
+            for alert in plan.alerts[:3]:
+                lines.append(f"  • {alert}")
 
         return "\n".join(lines)
 

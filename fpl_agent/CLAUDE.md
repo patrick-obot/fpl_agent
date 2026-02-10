@@ -100,7 +100,8 @@ docker compose exec fpl-agent python main.py price-check            # Price chec
 See `.env.example` for full list. Required:
 - `FPL_EMAIL`, `FPL_PASSWORD`, `FPL_TEAM_ID` - FPL credentials
 - `DRY_RUN=false` - Enable live execution
-- `SMTP_*`, `NOTIFICATION_EMAIL` - Email notifications (optional)
+- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` - Telegram notifications (recommended)
+- `SMTP_*`, `NOTIFICATION_EMAIL` - Email notifications (optional fallback)
 
 ## Railway Backup
 
@@ -111,7 +112,7 @@ Railway config files are kept as backup in case of fallback:
 
 - **Mode**: Fully autonomous (`confirm=True`, no human approval needed)
 - **Projections loaded**: GW25-34
-- **Email notifications**: Results-only (sent AFTER execution, NOT for approval)
+- **Notifications**: Telegram (primary) + Email (fallback), sent AFTER execution
 - **Approval workflow**: Disabled - scheduler uses `confirm=True` at `main.py:522`
 - **All critical bugs fixed**: Stale price cache, captain not set, approval blocking
 
@@ -142,11 +143,15 @@ pytest tests/ -v --cov=src      # With coverage
 
 ## Change Log
 
-### Feb 10, 2026 - Session 3: Migrate to VPS deployment
+### Feb 10, 2026 - Session 3: VPS deployment + Telegram notifications
 
 - **Migration**: Moved from Railway to Hostinger VPS with Docker
 - Added `docker-compose.yml` for easy deployment
 - Added `.env.example` template for environment variables
+- **Telegram notifications**: Added `_send_telegram()` to `NotificationService`
+  - Sends formatted messages with emojis for transfers, captain, lineup
+  - Config: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` in `.env`
+  - Telegram is primary, email is fallback
 - Updated CLAUDE.md with VPS deployment instructions
 - Kept Railway config files (`railway.toml`, etc.) as backup
 
