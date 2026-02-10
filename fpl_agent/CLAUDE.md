@@ -161,7 +161,7 @@ pytest tests/ -v --cov=src      # With coverage
 
 ## Change Log
 
-### Feb 10, 2026 - Session 3: VPS deployment + Telegram notifications
+### Feb 10, 2026 - Session 3: VPS deployment + Telegram + team limit fix
 
 - **Migration**: Moved from Railway to Hostinger VPS with Docker
 - Added `docker-compose.yml` for easy deployment
@@ -170,6 +170,10 @@ pytest tests/ -v --cov=src      # With coverage
   - Sends formatted messages with emojis for transfers, captain, lineup
   - Config: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` in `.env`
   - Telegram is primary, email is fallback
+- **Bug fix**: Max 3 players per team now enforced across multiple transfers
+  - `_apply_transfer_limits()` tracks `pending_team_counts` between transfers
+  - Prevents recommending transfers that would result in 4+ players from same team
+  - Also added team limit check in `select_starting_xi_and_bench()`
 - Updated CLAUDE.md with VPS deployment instructions
 - Kept Railway config files (`railway.toml`, etc.) as backup
 
