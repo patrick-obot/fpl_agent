@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Autonomous Fantasy Premier League agent that runs on Railway. Collects player data, optimizes transfers/captaincy, and executes changes via the FPL API. Runs as a scheduler daemon with no human intervention.
+Autonomous Fantasy Premier League agent. Collects player data, optimizes transfers/captaincy, and executes changes via the FPL API. Runs as a scheduler daemon with no human intervention.
 
 ## Architecture
 
@@ -21,14 +21,14 @@ src/
 ```bash
 python main.py                        # Dry-run (default)
 python main.py --mode live --confirm  # Live execution
-python main.py schedule               # Scheduler daemon (Railway)
+python main.py schedule               # Scheduler daemon
 python main.py price-check            # Price monitoring only
 python main.py approve <plan_id>      # Approve pending plan (not used in autonomous mode)
 ```
 
-## Scheduler (Railway daemon)
+## Scheduler
 
-Runs via `railway.toml` -> `python main.py schedule`. Three scheduled actions:
+Runs via `python main.py schedule` (started by Docker). Three scheduled actions:
 - **01:30 UTC daily**: Price change monitoring
 - **48h before GW deadline**: Preparation run (analysis only, no execution)
 - **2h before GW deadline**: Final execution (autonomous, `confirm=True`)
@@ -62,18 +62,50 @@ Checks every 5 minutes. Tracks `last_*` dates to avoid duplicate runs.
 - `data/states/*.json` - Team state snapshots
 - `data/price_changes_*.csv` - Daily price reports
 
-## Deployment
+## Deployment (VPS with Docker)
 
-- **Platform**: Railway (auto-deploys from `master`)
-- **Container**: Playwright Python base image (for auth)
-- **Config**: `railway.toml`, `Dockerfile`, `.railwayignore`
-- Push to `master` -> Railway auto-builds and deploys
-- **Railway CLI**: Linked to service `fpl-agent` in `production` environment
+**Platform**: Hostinger VPS with Docker
 
-## Environment Variables (in Railway)
+### Initial Setup
+```bash
+# Clone repo
+git clone git@github.com:patrick-obot/fpl_agent.git
+cd fpl_agent
 
-FPL_EMAIL, FPL_PASSWORD, FPL_TEAM_ID, DRY_RUN (false), LOG_LEVEL,
-SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, NOTIFICATION_EMAIL
+# Create .env from template
+cp .env.example .env
+nano .env  # Fill in your credentials
+
+# Build and start
+docker compose up -d --build
+
+# Check logs
+docker compose logs -f
+```
+
+### Updating
+```bash
+git pull && docker compose up -d --build
+```
+
+### Manual Commands
+```bash
+docker compose exec fpl-agent python main.py                        # Dry-run
+docker compose exec fpl-agent python main.py --mode live --confirm  # Live execution
+docker compose exec fpl-agent python main.py price-check            # Price check
+```
+
+## Environment Variables
+
+See `.env.example` for full list. Required:
+- `FPL_EMAIL`, `FPL_PASSWORD`, `FPL_TEAM_ID` - FPL credentials
+- `DRY_RUN=false` - Enable live execution
+- `SMTP_*`, `NOTIFICATION_EMAIL` - Email notifications (optional)
+
+## Railway Backup
+
+Railway config files are kept as backup in case of fallback:
+- `railway.toml`, `nixpacks.toml`, `.railwayignore`, `Procfile`, `RAILWAY_DEPLOY.md`
 
 ## Current Status (Feb 10, 2026)
 
@@ -109,6 +141,14 @@ pytest tests/ -v --cov=src      # With coverage
 ---
 
 ## Change Log
+
+### Feb 10, 2026 - Session 3: Migrate to VPS deployment
+
+- **Migration**: Moved from Railway to Hostinger VPS with Docker
+- Added `docker-compose.yml` for easy deployment
+- Added `.env.example` template for environment variables
+- Updated CLAUDE.md with VPS deployment instructions
+- Kept Railway config files (`railway.toml`, etc.) as backup
 
 ### Feb 3, 2026 - Session 2: Set lineup + bench order after transfers
 

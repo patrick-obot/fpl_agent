@@ -1,0 +1,13 @@
+version: "3.8"
+
+services:
+  fpl-agent:
+    build: .
+    container_name: fpl-agent
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: python main.py schedule
