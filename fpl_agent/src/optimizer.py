@@ -633,39 +633,33 @@ class CaptainSelector:
     def _calculate_captain_score(
         self, player: Player, row: pd.Series, is_home: bool
     ) -> float:
-        """Calculate expected captain score."""
-        base_score = 0.0
+        """
+        Calculate expected captain score.
 
-        # Projected points (primary factor)
+        Returns a score close to expected points (doubled for captain).
+        Primary factor is projected points from CSV, with small bonuses.
+        """
+        # Projected points is the primary factor (x2 for captain effect)
         projected = float(row.get("gw1_projected", 0) or 0)
         if projected > 0:
-            base_score += projected * 3.0
+            base_score = projected * 2.0  # Captain doubles points
         else:
             # Fallback to form-based estimation
-            base_score += float(row.get("form", 0)) * 2.0
+            base_score = float(row.get("form", 0)) * 2.0
 
-        # xGI contribution
-        base_score += float(row.get("xGI", 0)) * 2.0
-
-        # Fixture difficulty bonus
+        # Small fixture difficulty bonus (max +1.5 pts for easiest fixture)
         fixture = float(row.get("fixture_difficulty", 3.0))
-        base_score += (5 - fixture) * 1.5
+        base_score += (5 - fixture) * 0.3
 
-        # Home advantage
+        # Small home advantage bonus (+5%)
         if is_home:
-            base_score *= 1.1
-
-        # Premium player bonus
-        if player.now_cost >= 10.0:
-            base_score *= 1.1
-        elif player.now_cost >= 12.0:
-            base_score *= 1.15
-
-        # Form bonus
-        if player.form >= 7.0:
-            base_score *= 1.1
-        elif player.form >= 5.0:
             base_score *= 1.05
+
+        # Small form bonus (max +5%)
+        if player.form >= 7.0:
+            base_score *= 1.05
+        elif player.form >= 5.0:
+            base_score *= 1.02
 
         # Availability penalty
         availability = float(row.get("availability", 1.0))
@@ -732,10 +726,10 @@ class CaptainSelector:
         elif player.form >= 5.5:
             reasons.append("Good form")
 
-        # xGI
-        xgi = float(row.get("xGI", 0))
-        if xgi >= 0.6:
-            reasons.append(f"High xGI ({xgi:.2f})")
+        # Projected points
+        projected = float(row.get("gw1_projected", 0) or 0)
+        if projected >= 6.0:
+            reasons.append(f"High projected ({projected:.1f} pts)")
 
         # Premium
         if player.now_cost >= 12.0:
