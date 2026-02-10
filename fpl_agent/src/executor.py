@@ -456,6 +456,27 @@ class NotificationService:
 
         return "\n".join(lines)
 
+    def _resolve_player_name(self, player_id: int, plan: ExecutionPlan) -> str:
+        """Resolve player ID to name using plan data."""
+        # Check transfers (in/out names)
+        for t in plan.transfers:
+            if t.player_in_id == player_id:
+                return t.player_in_name
+            if t.player_out_id == player_id:
+                return t.player_out_name
+        # Check captain
+        if plan.captain:
+            if plan.captain.captain_id == player_id:
+                return plan.captain.captain_name
+            if plan.captain.vice_captain_id == player_id:
+                return plan.captain.vice_captain_name
+        # Check team state
+        if plan.team_state_before:
+            for pick in plan.team_state_before.picks:
+                if pick.get("element") == player_id:
+                    return pick.get("web_name", str(player_id))
+        return str(player_id)
+
     def _format_telegram_result(self, result: ExecutionResult) -> str:
         """Format execution result for Telegram."""
         status = "✅ SUCCESS" if result.success else "❌ FAILED"
@@ -480,9 +501,16 @@ class NotificationService:
             lines.append(f"\n<b>Captain:</b> {plan.captain.captain_name} (C)")
             lines.append(f"<b>Vice:</b> {plan.captain.vice_captain_name} (V)")
 
-        # Lineup
-        if result.lineup_set:
-            lines.append("\n✅ Lineup set")
+        # Lineup with player names
+        if result.lineup_set and plan.starting_xi:
+            lines.append("\n<b>Starting XI:</b>")
+            xi_names = [self._resolve_player_name(pid, plan) for pid in plan.starting_xi]
+            lines.append(", ".join(xi_names))
+
+            if plan.bench_order:
+                lines.append("\n<b>Bench:</b>")
+                bench_names = [self._resolve_player_name(pid, plan) for pid in plan.bench_order]
+                lines.append(", ".join(bench_names))
 
         # Summary
         lines.extend([
