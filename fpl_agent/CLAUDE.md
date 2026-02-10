@@ -73,7 +73,7 @@ This ensures auto-subs bring on the best available player if a starter doesn't p
 
 ## Data Files
 
-- `data/projected_points.csv` - External projections (GW25-34, manually uploaded)
+- `data/projected_points.csv` - External projections (GW26-35, manually uploaded)
 - `data/data_cache.pkl` - 5-min API response cache
 - `data/audit_trail.json` - Decision audit log
 - `data/plans/*.json` - Execution plan history
@@ -129,7 +129,7 @@ Railway config files are kept as backup in case of fallback:
 ## Current Status (Feb 10, 2026)
 
 - **Mode**: Fully autonomous (`confirm=True`, no human approval needed)
-- **Projections loaded**: GW25-34
+- **Projections loaded**: GW26-35
 - **Notifications**: Telegram (primary) + Email (fallback), sent AFTER execution
 - **Approval workflow**: Disabled - scheduler uses `confirm=True` at `main.py:522`
 - **All critical bugs fixed**: Stale price cache, captain not set, approval blocking
