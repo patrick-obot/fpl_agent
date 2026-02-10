@@ -905,6 +905,15 @@ class ChipStrategyAdvisor:
             score += 10
             reasons.append("Okay bench fixtures")
 
+        # Factor 4: Squad DGW coverage (how many of your 15 have DGW)
+        squad_dgw_count = self._count_squad_dgw_players()
+        if squad_dgw_count >= 10:
+            score += 25
+            reasons.append(f"{squad_dgw_count} squad players with DGW")
+        elif squad_dgw_count >= 6:
+            score += 15
+            reasons.append(f"{squad_dgw_count} players doubling")
+
         is_recommended = score >= self.BENCH_BOOST_THRESHOLD
 
         return ChipRecommendation(
@@ -1039,9 +1048,21 @@ class ChipStrategyAdvisor:
 
     def _detect_double_gameweek(self) -> int:
         """Detect teams with double gameweek fixtures."""
-        # This would check for DGW from fixture data
-        # Simplified: check for multiple fixtures in gw columns
-        return 0  # Would need DGW data
+        if self.fixtures_df is None or self.fixtures_df.empty:
+            return 0
+
+        # Check for next_gw_dgw column (added by get_fixture_ticker)
+        if "next_gw_dgw" in self.fixtures_df.columns:
+            return int(self.fixtures_df["next_gw_dgw"].sum())
+
+        # Fallback: check for " + " in fixture strings (indicates DGW)
+        dgw_count = 0
+        for col in self.fixtures_df.columns:
+            if col.startswith("gw") and not col.endswith("_diff") and not col.endswith("_dgw"):
+                dgw_count += self.fixtures_df[col].str.contains(r"\+", na=False).sum()
+                break  # Only check first GW column
+
+        return dgw_count
 
     def _calculate_bench_strength(self) -> float:
         """Calculate total expected points from bench."""
@@ -1101,9 +1122,43 @@ class ChipStrategyAdvisor:
             return 0
         return len(self.fixtures_df[self.fixtures_df["avg_difficulty"] <= 2.5])
 
+    def _count_squad_dgw_players(self) -> int:
+        """Count squad players with DGW fixtures."""
+        if self.fixtures_df is None or self.fixtures_df.empty:
+            return 0
+
+        # Get teams with DGW
+        dgw_teams = set()
+        if "next_gw_dgw" in self.fixtures_df.columns:
+            dgw_teams = set(
+                self.fixtures_df[self.fixtures_df["next_gw_dgw"] == True]["team_id"].values
+            )
+
+        if not dgw_teams:
+            return 0
+
+        return sum(1 for player in self.squad if player.team in dgw_teams)
+
     def _has_premium_dgw_player(self) -> bool:
-        """Check if any premium player has DGW."""
-        # Simplified - would need DGW data
+        """Check if any premium player (>= 10m) has DGW."""
+        if self.fixtures_df is None or self.fixtures_df.empty:
+            return False
+
+        # Get teams with DGW
+        dgw_teams = set()
+        if "next_gw_dgw" in self.fixtures_df.columns:
+            dgw_teams = set(
+                self.fixtures_df[self.fixtures_df["next_gw_dgw"] == True]["team_id"].values
+            )
+
+        if not dgw_teams:
+            return False
+
+        # Check if any premium player (>= 10m) is from a DGW team
+        for player in self.squad:
+            if player.now_cost >= 10.0 and player.team in dgw_teams:
+                return True
+
         return False
 
     def _get_premium_fixture_score(self) -> float:

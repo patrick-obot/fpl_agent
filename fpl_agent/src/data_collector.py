@@ -884,6 +884,7 @@ class DataCollector:
 
         Returns:
             DataFrame with team fixtures across gameweeks.
+            Includes DGW detection (gw{N}_dgw = True if 2+ fixtures).
         """
         data = []
 
@@ -896,9 +897,47 @@ class DataCollector:
                 "rating": team_fixtures.fixture_difficulty_rating,
             }
 
-            for i, fixture in enumerate(team_fixtures.fixtures[:gameweeks]):
-                row[f"gw{fixture.gameweek}"] = fixture.fixture_string
-                row[f"gw{fixture.gameweek}_diff"] = fixture.difficulty
+            # Group fixtures by gameweek to detect DGWs
+            gw_fixtures: dict[int, list] = {}
+            for fixture in team_fixtures.fixtures:
+                gw = fixture.gameweek
+                if gw not in gw_fixtures:
+                    gw_fixtures[gw] = []
+                gw_fixtures[gw].append(fixture)
+
+            # Add fixture info for each GW
+            first_gw = None
+            for gw, fixtures in sorted(gw_fixtures.items())[:gameweeks]:
+                if first_gw is None:
+                    first_gw = gw
+
+                is_dgw = len(fixtures) >= 2
+                is_bgw = len(fixtures) == 0
+
+                if is_dgw:
+                    # Combine fixture strings for DGW
+                    fixture_strs = [f.fixture_string for f in fixtures]
+                    row[f"gw{gw}"] = " + ".join(fixture_strs)
+                    row[f"gw{gw}_diff"] = sum(f.difficulty for f in fixtures) / len(fixtures)
+                elif is_bgw:
+                    row[f"gw{gw}"] = "BGW"
+                    row[f"gw{gw}_diff"] = 0
+                else:
+                    row[f"gw{gw}"] = fixtures[0].fixture_string
+                    row[f"gw{gw}_diff"] = fixtures[0].difficulty
+
+                row[f"gw{gw}_dgw"] = is_dgw
+                row[f"gw{gw}_fixture_count"] = len(fixtures)
+
+            # Add flag for next GW DGW
+            if first_gw and first_gw in gw_fixtures:
+                row["next_gw"] = first_gw
+                row["next_gw_dgw"] = len(gw_fixtures[first_gw]) >= 2
+                row["next_gw_fixture_count"] = len(gw_fixtures[first_gw])
+            else:
+                row["next_gw"] = None
+                row["next_gw_dgw"] = False
+                row["next_gw_fixture_count"] = 0
 
             data.append(row)
 
