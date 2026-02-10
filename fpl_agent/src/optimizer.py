@@ -472,6 +472,8 @@ class TransferOptimizer:
         transfers_used = 0
         players_in = set()  # Track players already being transferred in
         players_out = set()  # Track players already being transferred out
+        # Track team counts including pending transfers
+        pending_team_counts = dict(self.team_counts)
 
         for rec in recommendations:
             # Skip if this player is already being transferred in or out
@@ -479,6 +481,19 @@ class TransferOptimizer:
                 continue
             if rec.player_out.id in players_out:
                 continue
+
+            # Check if this transfer would violate team limits
+            player_in_team = rec.player_in.team
+            player_out_team = rec.player_out.team
+            new_count = pending_team_counts.get(player_in_team, 0)
+            if player_in_team != player_out_team:
+                # Adding player from different team
+                if new_count >= self.MAX_FROM_TEAM:
+                    self.logger.debug(
+                        f"Skipping {rec.player_in.web_name}: would exceed {self.MAX_FROM_TEAM} "
+                        f"players from team {player_in_team}"
+                    )
+                    continue
 
             # Calculate hit cost
             if transfers_used < self.free_transfers:
@@ -492,26 +507,29 @@ class TransferOptimizer:
             is_injury_replacement = rec.priority == 1  # Priority 1 = injury/unavailable
             is_free_transfer = transfers_used < self.free_transfers
 
+            def accept_transfer():
+                """Accept the transfer and update tracking."""
+                nonlocal transfers_used
+                final.append(rec)
+                transfers_used += 1
+                players_in.add(rec.player_in.id)
+                players_out.add(rec.player_out.id)
+                # Update team counts
+                if player_in_team != player_out_team:
+                    pending_team_counts[player_in_team] = pending_team_counts.get(player_in_team, 0) + 1
+                    pending_team_counts[player_out_team] = pending_team_counts.get(player_out_team, 1) - 1
+
             if is_free_transfer:
                 # Free transfers: include if net gain is positive
                 if rec.net_gain > 0:
-                    final.append(rec)
-                    transfers_used += 1
-                    players_in.add(rec.player_in.id)
-                    players_out.add(rec.player_out.id)
+                    accept_transfer()
             else:
                 # Hit transfer: only for injuries or exceptional gains
                 if is_injury_replacement and rec.net_gain > 0:
-                    final.append(rec)
-                    transfers_used += 1
-                    players_in.add(rec.player_in.id)
-                    players_out.add(rec.player_out.id)
+                    accept_transfer()
                 elif rec.net_gain >= self.HIT_WORTHWHILE_THRESHOLD:
                     # Exceptional gain that justifies the hit
-                    final.append(rec)
-                    transfers_used += 1
-                    players_in.add(rec.player_in.id)
-                    players_out.add(rec.player_out.id)
+                    accept_transfer()
 
         return final
 
