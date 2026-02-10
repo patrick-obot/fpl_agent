@@ -126,6 +126,28 @@ See `.env.example` for full list. Required:
 Railway config files are kept as backup in case of fallback:
 - `railway.toml`, `nixpacks.toml`, `.railwayignore`, `Procfile`, `RAILWAY_DEPLOY.md`
 
+## Chip Strategy (`src/optimizer.py`)
+
+**Proactive Wildcard Strategy:**
+- If DGW coming in GW+1 and BB available, WC is recommended to maximize DGW players
+- WC score boosted by +40 if 4+ teams doubling, +20 if 2+ teams
+
+**BB vs TC Decision on DGW:**
+- Compares chip value (extra points gained):
+  - BB value = sum of bench 4 players' xPts
+  - TC value = best captain's xPts (extra beyond normal 2x)
+- Recommends chip with higher expected value
+- Logs comparison: "Chip comparison: BB xPts=X, TC xPts=Y"
+
+**End-of-Season Urgency (GW38):**
+- 3 GWs remaining: +30 boost to all chip scores, "Only N GWs left" reason
+- 5 GWs remaining: +15 boost
+- All chips must be used by GW38
+
+**No DGW Scenario:**
+- If no DGWs remaining and chips available, still uses expected points for decisions
+- BB vs TC compared purely on xPts, recommends whichever is higher
+
 ## Current Status (Feb 10, 2026)
 
 - **Mode**: Fully autonomous (`confirm=True`, no human approval needed)
@@ -133,6 +155,7 @@ Railway config files are kept as backup in case of fallback:
 - **Notifications**: Telegram (primary) + Email (fallback), sent AFTER execution
 - **Approval workflow**: Disabled - scheduler uses `confirm=True` at `main.py:522`
 - **All critical bugs fixed**: Stale price cache, captain not set, approval blocking
+- **Chip strategy**: Proactive WC for DGW prep, BB vs TC by xPts, GW38 urgency
 
 ### How Autonomous Execution Works
 
@@ -160,6 +183,28 @@ pytest tests/ -v --cov=src      # With coverage
 ---
 
 ## Change Log
+
+### Feb 10, 2026 - Session 4: Proactive chip strategy + BB vs TC logic
+
+- **Proactive WC strategy**: If DGW coming in GW+1 and BB available, boost WC recommendation
+  - Score +40 if 4+ teams doubling in GW+1
+  - Score +20 if 2+ teams doubling in GW+1
+  - Allows building optimal DGW squad for Bench Boost
+- **BB vs TC comparison**: On DGW, compare chip VALUE (extra points gained)
+  - BB value = sum of bench 4 players' xPts
+  - TC value = best captain's xPts (extra beyond normal captain 2x)
+  - Recommends chip with higher expected value
+  - Winner gets +15 score boost, loser gets -20 penalty
+- **End-of-season urgency**: All chips must be used by GW38
+  - 3 GWs remaining: +30 boost to all chip scores
+  - 5 GWs remaining: +15 boost
+  - Adds reason "Only N GWs left - use [chip]"
+- **No DGW fallback**: If no DGWs remaining, still compares BB vs TC on xPts
+- Added `_detect_upcoming_dgw()` to scan future GWs for DGWs
+- Added `_calculate_bb_expected_points()` (bench 4 xPts sum)
+- Added `_calculate_tc_expected_points()` (best captain xPts)
+- Added `_get_gameweeks_remaining()` for end-of-season logic
+- `ChipStrategyAdvisor` now takes `current_gameweek` parameter
 
 ### Feb 10, 2026 - Session 3: VPS deployment + Telegram + multiple fixes
 

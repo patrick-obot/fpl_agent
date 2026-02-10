@@ -751,10 +751,14 @@ class ChipStrategyAdvisor:
     Advises on optimal chip usage timing.
 
     Detects:
-    - Wildcard opportunities (injuries, fixture swings)
+    - Wildcard opportunities (injuries, fixture swings, DGW preparation)
     - Bench boost timing (double gameweeks)
     - Free hit opportunities (blank gameweeks)
     - Triple captain opportunities
+
+    Proactive strategy:
+    - If DGW coming in GW+1 and BB available, recommend WC now to prepare
+    - On DGW, compare BB vs TC expected points and recommend the better one
     """
 
     # Thresholds for recommendations
@@ -770,6 +774,7 @@ class ChipStrategyAdvisor:
         fixtures_df: pd.DataFrame,
         available_chips: list[str],
         free_transfers: int = 1,
+        current_gameweek: int = 1,
     ):
         """
         Initialize chip strategy advisor.
@@ -780,17 +785,25 @@ class ChipStrategyAdvisor:
             fixtures_df: Fixture ticker DataFrame.
             available_chips: List of available chip names.
             free_transfers: Current free transfers.
+            current_gameweek: Current gameweek number.
         """
         self.squad = squad
         self.player_df = player_df
         self.fixtures_df = fixtures_df
         self.available_chips = available_chips
         self.free_transfers = free_transfers
+        self.current_gameweek = current_gameweek
         self.logger = logging.getLogger("fpl_agent.optimizer.chips")
 
     def analyze(self, gameweeks_ahead: int = 5) -> list[ChipRecommendation]:
         """
         Analyze and recommend chip usage.
+
+        Proactive strategy:
+        - If DGW coming in GW+1 and BB available, boost WC recommendation
+        - On DGW, compare BB vs TC expected points and recommend the better one
+        - End-of-season urgency: force chip usage as GW38 approaches
+        - If no DGWs available, compare chips purely on expected points
 
         Args:
             gameweeks_ahead: Number of gameweeks to analyze.
@@ -800,36 +813,127 @@ class ChipStrategyAdvisor:
         """
         recommendations = []
 
+        # Detect DGW in current and future GWs
+        dgw_this_gw = self._detect_double_gameweek()
+        dgw_next_gw = self._detect_upcoming_dgw(1)  # Check GW+1
+        gws_remaining = self._get_gameweeks_remaining()
+
+        # Check for any upcoming DGWs (scan up to 5 GWs ahead)
+        any_dgw_upcoming = dgw_this_gw > 0 or dgw_next_gw > 0
+        for gw_ahead in range(2, min(6, gws_remaining + 1)):
+            if self._detect_upcoming_dgw(gw_ahead) > 0:
+                any_dgw_upcoming = True
+                break
+
+        # End-of-season urgency: chips must be used by GW38
+        end_of_season_urgency = 0
+        if gws_remaining <= 3:
+            end_of_season_urgency = 30  # Very urgent
+            self.logger.info(f"End-of-season urgency: {gws_remaining} GWs remaining")
+        elif gws_remaining <= 5:
+            end_of_season_urgency = 15  # Moderately urgent
+
         # Analyze each chip type
         if "wildcard" in self.available_chips:
-            wc_rec = self._analyze_wildcard()
+            wc_rec = self._analyze_wildcard(dgw_next_gw=dgw_next_gw)
             if wc_rec:
+                # Boost WC if end-of-season
+                if end_of_season_urgency > 0:
+                    wc_rec.score = min(100, wc_rec.score + end_of_season_urgency)
+                    wc_rec.reasons.insert(0, f"Only {gws_remaining} GWs left - use WC")
+                    wc_rec.is_recommended = wc_rec.score >= self.WILDCARD_THRESHOLD
                 recommendations.append(wc_rec)
+
+        # On DGW, compare BB vs TC and only recommend the better one
+        bb_rec = None
+        tc_rec = None
 
         if "bench_boost" in self.available_chips:
             bb_rec = self._analyze_bench_boost()
-            if bb_rec:
-                recommendations.append(bb_rec)
+
+        if "triple_captain" in self.available_chips:
+            tc_rec = self._analyze_triple_captain()
+
+        # Calculate expected points for comparison
+        bb_xpts = self._calculate_bb_expected_points() if bb_rec else 0
+        tc_xpts = self._calculate_tc_expected_points() if tc_rec else 0
+
+        # BB vs TC decision based on expected points
+        if bb_rec and tc_rec:
+            # Apply end-of-season urgency first
+            if end_of_season_urgency > 0:
+                bb_rec.score = min(100, bb_rec.score + end_of_season_urgency)
+                bb_rec.reasons.insert(0, f"Only {gws_remaining} GWs left")
+                tc_rec.score = min(100, tc_rec.score + end_of_season_urgency)
+                tc_rec.reasons.insert(0, f"Only {gws_remaining} GWs left")
+
+            # Compare chips on expected points (DGW or no DGW)
+            if dgw_this_gw > 0 or not any_dgw_upcoming or gws_remaining <= 3:
+                self.logger.info(
+                    f"Chip comparison (GW{self.current_gameweek}): BB xPts={bb_xpts:.1f}, TC xPts={tc_xpts:.1f}"
+                )
+
+                if bb_xpts > tc_xpts:
+                    # BB is better - boost BB score, reduce TC score
+                    bb_rec.score = min(100, bb_rec.score + 15)
+                    bb_rec.reasons.insert(0, f"BB ({bb_xpts:.1f} xPts) > TC ({tc_xpts:.1f} xPts)")
+                    bb_rec.is_recommended = bb_rec.score >= self.BENCH_BOOST_THRESHOLD
+
+                    if dgw_this_gw > 0 or gws_remaining <= 3:
+                        tc_rec.score = max(0, tc_rec.score - 20)
+                        tc_rec.reasons.insert(0, f"TC ({tc_xpts:.1f} xPts) < BB ({bb_xpts:.1f} xPts)")
+                        tc_rec.is_recommended = False
+                else:
+                    # TC is better - boost TC score, reduce BB score
+                    tc_rec.score = min(100, tc_rec.score + 15)
+                    tc_rec.reasons.insert(0, f"TC ({tc_xpts:.1f} xPts) > BB ({bb_xpts:.1f} xPts)")
+                    tc_rec.is_recommended = tc_rec.score >= self.TRIPLE_CAPTAIN_THRESHOLD
+
+                    if dgw_this_gw > 0 or gws_remaining <= 3:
+                        bb_rec.score = max(0, bb_rec.score - 20)
+                        bb_rec.reasons.insert(0, f"BB ({bb_xpts:.1f} xPts) < TC ({tc_xpts:.1f} xPts)")
+                        bb_rec.is_recommended = False
+
+        if bb_rec:
+            recommendations.append(bb_rec)
+        if tc_rec:
+            recommendations.append(tc_rec)
 
         if "free_hit" in self.available_chips:
             fh_rec = self._analyze_free_hit()
             if fh_rec:
+                # Boost FH if end-of-season
+                if end_of_season_urgency > 0:
+                    fh_rec.score = min(100, fh_rec.score + end_of_season_urgency)
+                    fh_rec.reasons.insert(0, f"Only {gws_remaining} GWs left - use FH")
+                    fh_rec.is_recommended = fh_rec.score >= self.FREE_HIT_THRESHOLD
                 recommendations.append(fh_rec)
-
-        if "triple_captain" in self.available_chips:
-            tc_rec = self._analyze_triple_captain()
-            if tc_rec:
-                recommendations.append(tc_rec)
 
         # Sort by score
         recommendations.sort(key=lambda x: -x.score)
 
         return recommendations
 
-    def _analyze_wildcard(self) -> Optional[ChipRecommendation]:
-        """Analyze wildcard opportunity."""
+    def _analyze_wildcard(self, dgw_next_gw: int = 0) -> Optional[ChipRecommendation]:
+        """
+        Analyze wildcard opportunity.
+
+        Proactive strategy: If DGW coming in GW+1 and BB available,
+        recommend WC now to maximize DGW players for BB.
+
+        Args:
+            dgw_next_gw: Number of teams with DGW in GW+1.
+        """
         score = 0.0
         reasons = []
+
+        # PROACTIVE FACTOR: DGW coming next week and BB available
+        if dgw_next_gw >= 4 and "bench_boost" in self.available_chips:
+            score += 40
+            reasons.append(f"DGW in GW+1 ({dgw_next_gw} teams) - prepare for BB")
+        elif dgw_next_gw >= 2 and "bench_boost" in self.available_chips:
+            score += 20
+            reasons.append(f"Partial DGW in GW+1 ({dgw_next_gw} teams)")
 
         # Factor 1: Squad injuries
         injured_count = self._count_injured_players()
@@ -867,7 +971,7 @@ class ChipStrategyAdvisor:
 
         return ChipRecommendation(
             chip_name="wildcard",
-            gameweek=1,  # This gameweek
+            gameweek=self.current_gameweek,
             score=min(100, score),
             reasons=reasons,
             is_recommended=is_recommended,
@@ -918,7 +1022,7 @@ class ChipStrategyAdvisor:
 
         return ChipRecommendation(
             chip_name="bench_boost",
-            gameweek=1,
+            gameweek=self.current_gameweek,
             score=min(100, score),
             reasons=reasons,
             is_recommended=is_recommended,
@@ -957,7 +1061,7 @@ class ChipStrategyAdvisor:
 
         return ChipRecommendation(
             chip_name="free_hit",
-            gameweek=1,
+            gameweek=self.current_gameweek,
             score=min(100, score),
             reasons=reasons,
             is_recommended=is_recommended,
@@ -996,7 +1100,7 @@ class ChipStrategyAdvisor:
 
         return ChipRecommendation(
             chip_name="triple_captain",
-            gameweek=1,
+            gameweek=self.current_gameweek,
             score=min(100, score),
             reasons=reasons,
             is_recommended=is_recommended,
@@ -1184,6 +1288,91 @@ class ChipStrategyAdvisor:
 
         return max(p.form for p in premiums)
 
+    def _detect_upcoming_dgw(self, gameweeks_ahead: int = 1) -> int:
+        """
+        Detect teams with DGW in future gameweeks.
+
+        Args:
+            gameweeks_ahead: How many GWs ahead to check (1 = next GW).
+
+        Returns:
+            Number of teams with DGW in that gameweek.
+        """
+        if self.fixtures_df is None or self.fixtures_df.empty:
+            return 0
+
+        target_gw = self.current_gameweek + gameweeks_ahead
+        dgw_col = f"gw{target_gw}_dgw"
+
+        if dgw_col in self.fixtures_df.columns:
+            return int(self.fixtures_df[dgw_col].sum())
+
+        return 0
+
+    def _calculate_bb_expected_points(self) -> float:
+        """
+        Calculate expected CHIP VALUE if Bench Boost is played.
+
+        BB chip value = sum of bench 4 players' xPts (extra points beyond normal 11).
+
+        Returns:
+            Sum of bench 4 players' projected points.
+        """
+        # Get xPts for all players
+        player_xpts = []
+        for player in self.squad:
+            row = self.player_df[self.player_df["player_id"] == player.id]
+            if not row.empty:
+                row = row.iloc[0]
+                xpts = float(row.get("gw1_projected", 0) or 0)
+                # Fallback to form if no projection
+                if xpts == 0:
+                    xpts = float(row.get("form", 0) or 0)
+                player_xpts.append((player, xpts))
+
+        # Sort by xPts to identify bench (lowest 4)
+        player_xpts.sort(key=lambda x: x[1], reverse=True)
+
+        # BB value = sum of bench 4 players' xPts
+        if len(player_xpts) >= 15:
+            bench_xpts = sum(xpts for _, xpts in player_xpts[11:15])
+            return bench_xpts
+
+        return 0.0
+
+    def _calculate_tc_expected_points(self) -> float:
+        """
+        Calculate expected CHIP VALUE if Triple Captain is played.
+
+        TC chip value = best captain's xPts * 1 (extra points beyond normal captain 2x).
+
+        Returns:
+            Best captain's projected points (the extra from TC).
+        """
+        best_captain_xpts = 0.0
+
+        for player in self.squad:
+            row = self.player_df[self.player_df["player_id"] == player.id]
+            if not row.empty:
+                row = row.iloc[0]
+                xpts = float(row.get("gw1_projected", 0) or 0)
+                # Fallback to form if no projection
+                if xpts == 0:
+                    xpts = float(row.get("form", 0) or 0)
+
+                # Only consider available players
+                availability = float(row.get("availability", 1.0))
+                if availability >= 0.75 and xpts > best_captain_xpts:
+                    best_captain_xpts = xpts
+
+        # TC gives captain * 3 total, normal captain gives captain * 2
+        # Chip value = extra points = captain_xpts * 1
+        return best_captain_xpts
+
+    def _get_gameweeks_remaining(self) -> int:
+        """Get number of gameweeks remaining in the season."""
+        return max(0, 38 - self.current_gameweek)
+
 
 # =============================================================================
 # Main Optimizer Class
@@ -1322,12 +1511,25 @@ class Optimizer:
                     available_chips = ["wildcard", "bench_boost", "free_hit", "triple_captain"]
 
                 fixtures_df = self.collector.get_fixture_ticker()
+
+                # Get current gameweek
+                current_gw = 1
+                try:
+                    gameweeks = await self.client.get_gameweeks()
+                    for gw in gameweeks:
+                        if gw.is_current:
+                            current_gw = gw.id
+                            break
+                except Exception:
+                    pass  # Default to GW1 if can't fetch
+
                 chip_advisor = ChipStrategyAdvisor(
                     squad=current_squad,
                     player_df=player_df,
                     fixtures_df=fixtures_df,
                     available_chips=available_chips,
                     free_transfers=free_transfers,
+                    current_gameweek=current_gw,
                 )
                 result.chip_recommendations = chip_advisor.analyze()
 
