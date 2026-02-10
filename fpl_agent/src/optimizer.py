@@ -1473,6 +1473,14 @@ class Optimizer:
 
                 xi_ids = set(p.id for p in xi_candidates)
 
+            # Check max 3 players per team constraint
+            xi_players = [p for p in squad if p.id in xi_ids]
+            team_counts = {}
+            for p in xi_players:
+                team_counts[p.team] = team_counts.get(p.team, 0) + 1
+            if any(count > self.MAX_FROM_TEAM for count in team_counts.values()):
+                continue  # Skip this formation - violates team limit
+
             # Calculate total xPts for this XI
             total_xpts = sum(player_xpts[pid] for pid in xi_ids)
 
@@ -1484,6 +1492,18 @@ class Optimizer:
         if best_xi is None:
             self.logger.warning("Could not find valid formation including all transfers, using default")
             best_xi = [p.id for p in squad[:11]]
+
+        # Validate final XI doesn't violate team limit
+        final_xi_players = [p for p in squad if p.id in best_xi]
+        final_team_counts = {}
+        for p in final_xi_players:
+            final_team_counts[p.team] = final_team_counts.get(p.team, 0) + 1
+        for team_id, count in final_team_counts.items():
+            if count > self.MAX_FROM_TEAM:
+                self.logger.error(
+                    f"Starting XI violates team limit: {count} players from team {team_id} "
+                    f"(max {self.MAX_FROM_TEAM}). Squad may have invalid composition."
+                )
 
         # Build bench (remaining players not in starting XI)
         bench_players = [p for p in squad if p.id not in best_xi]
