@@ -338,21 +338,15 @@ class TransferOptimizer:
                     decay = 0.5 / i  # Decay for future weeks
                     score += future_pts * future_weight * decay
 
-        # 2. Form (recent performance)
-        score += float(row.get("form", 0)) * 1.5
+        # 2. Form (recent performance) - small bonus
+        score += float(row.get("form", 0)) * 0.5
 
-        # 3. Fixture difficulty (inverted - lower is better)
+        # 3. Fixture difficulty (inverted - lower is better) - small bonus
         fixture = float(row.get("fixture_difficulty", 3.0))
-        score += (5 - fixture) * 2.0
+        score += (5 - fixture) * 0.5
 
-        # 4. xGI (expected goal involvement)
-        score += float(row.get("xGI", 0)) * 2.0
-
-        # 5. Points per game (historical)
-        score += float(row.get("points_per_game", 0)) * 1.0
-
-        # 6. Value score (points per million)
-        score += float(row.get("value", 0)) * 0.5
+        # 4. Points per game (historical) - small bonus
+        score += float(row.get("points_per_game", 0)) * 0.3
 
         # 7. Availability penalty (injury/suspension)
         availability = float(row.get("availability", 1.0))
