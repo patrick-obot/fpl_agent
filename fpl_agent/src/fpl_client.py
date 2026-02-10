@@ -1503,9 +1503,20 @@ class FPLClient:
         # Build a map of element -> current pick data for selling/purchase prices
         current_picks = {pick.element: pick for pick in team.picks}
 
+        # Get all players to sort starting XI by element_type (position)
+        # FPL API requires picks ordered by ascending element_type: GK(1) -> DEF(2) -> MID(3) -> FWD(4)
+        players = await self.get_players()
+        player_map = {p.id: p for p in players}
+
+        # Sort starting XI by element_type
+        sorted_starting_xi = sorted(
+            starting_xi,
+            key=lambda pid: player_map[pid].element_type if pid in player_map else 99
+        )
+
         picks = []
-        # Starting XI: positions 1-11
-        for idx, player_id in enumerate(starting_xi, start=1):
+        # Starting XI: positions 1-11 (sorted by element_type)
+        for idx, player_id in enumerate(sorted_starting_xi, start=1):
             is_cap = player_id == captain_id
             picks.append({
                 "element": player_id,
@@ -1533,14 +1544,14 @@ class FPLClient:
         )
 
         self.logger.info(
-            f"Lineup set: {len(starting_xi)} starters, {len(bench_order)} bench, "
+            f"Lineup set: {len(sorted_starting_xi)} starters, {len(bench_order)} bench, "
             f"captain={captain_id}"
         )
         return {
             "success": True,
             "captain": captain_id,
             "vice_captain": vice_captain_id,
-            "starting_xi": starting_xi,
+            "starting_xi": sorted_starting_xi,
             "bench_order": bench_order,
             "message": "Lineup updated successfully",
         }
