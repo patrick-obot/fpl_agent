@@ -161,7 +161,7 @@ pytest tests/ -v --cov=src      # With coverage
 
 ## Change Log
 
-### Feb 10, 2026 - Session 3: VPS deployment + Telegram + team limit fix
+### Feb 10, 2026 - Session 3: VPS deployment + Telegram + multiple fixes
 
 - **Migration**: Moved from Railway to Hostinger VPS with Docker
 - Added `docker-compose.yml` for easy deployment
@@ -174,6 +174,13 @@ pytest tests/ -v --cov=src      # With coverage
   - `_apply_transfer_limits()` tracks `pending_team_counts` between transfers
   - Prevents recommending transfers that would result in 4+ players from same team
   - Also added team limit check in `select_starting_xi_and_bench()`
+- **Bug fix**: Captain/transfer scoring removed season xGI inflation
+  - Captain score now = projected_points * 2.0 + small bonuses
+  - Transfer score based on projected points, not season-long xGI
+- **Feature**: DGW detection for chip strategy
+  - Fixture ticker now includes `gw{N}_dgw`, `next_gw_dgw` columns
+  - Bench Boost considers squad DGW coverage
+  - Triple Captain detects premium players with DGW fixtures
 - Updated CLAUDE.md with VPS deployment instructions
 - Kept Railway config files (`railway.toml`, etc.) as backup
 
