@@ -165,6 +165,7 @@ class TransferOptimizer:
     """
 
     HIT_PENALTY = -4
+    MAX_HITS = 1  # Maximum hits allowed per gameweek
     MAX_FROM_TEAM = 3
     MIN_IMPROVEMENT_THRESHOLD = 4.0  # Minimum improvement to suggest transfer
     INJURY_REPLACEMENT_THRESHOLD = 2.0  # Lower threshold for replacing injured players
@@ -458,12 +459,14 @@ class TransferOptimizer:
         """
         Apply transfer limits and calculate hit costs.
 
-        Only uses free transfers by default. Hits are only taken when:
-        - Replacing injured/unavailable players (priority 1)
-        - Exceptional gain that justifies the -4 cost
+        Rules:
+        - Free transfers are used first (no cost)
+        - Maximum 1 hit allowed per gameweek (MAX_HITS = 1)
+        - Hit only taken for high expected points gain (>= HIT_WORTHWHILE_THRESHOLD)
         """
         final = []
         transfers_used = 0
+        hits_taken = 0  # Track hits to enforce MAX_HITS limit
         players_in = set()  # Track players already being transferred in
         players_out = set()  # Track players already being transferred out
         # Track team counts including pending transfers
@@ -489,23 +492,24 @@ class TransferOptimizer:
                     )
                     continue
 
+            # Determine if this is a free transfer or would require a hit
+            is_free_transfer = transfers_used < self.free_transfers
+
             # Calculate hit cost
-            if transfers_used < self.free_transfers:
+            if is_free_transfer:
                 rec.hit_cost = 0
             else:
                 rec.hit_cost = self.HIT_PENALTY
 
             rec.net_gain = rec.expected_gain + rec.hit_cost
 
-            # Determine if transfer should be included
-            is_injury_replacement = rec.priority == 1  # Priority 1 = injury/unavailable
-            is_free_transfer = transfers_used < self.free_transfers
-
             def accept_transfer():
                 """Accept the transfer and update tracking."""
-                nonlocal transfers_used
+                nonlocal transfers_used, hits_taken
                 final.append(rec)
                 transfers_used += 1
+                if rec.hit_cost < 0:
+                    hits_taken += 1
                 players_in.add(rec.player_in.id)
                 players_out.add(rec.player_out.id)
                 # Update team counts
@@ -518,11 +522,19 @@ class TransferOptimizer:
                 if rec.net_gain > 0:
                     accept_transfer()
             else:
-                # Hit transfer: only for injuries or exceptional gains
-                if is_injury_replacement and rec.net_gain > 0:
-                    accept_transfer()
-                elif rec.net_gain >= self.HIT_WORTHWHILE_THRESHOLD:
-                    # Exceptional gain that justifies the hit
+                # Hit transfer: only if under MAX_HITS limit and high expected gain
+                if hits_taken >= self.MAX_HITS:
+                    self.logger.debug(
+                        f"Skipping {rec.player_in.web_name}: already at max {self.MAX_HITS} hit(s)"
+                    )
+                    continue
+
+                # Only take hit for exceptional expected points gain
+                if rec.net_gain >= self.HIT_WORTHWHILE_THRESHOLD:
+                    self.logger.info(
+                        f"Taking hit for {rec.player_in.web_name}: "
+                        f"net gain {rec.net_gain:.1f} >= {self.HIT_WORTHWHILE_THRESHOLD}"
+                    )
                     accept_transfer()
 
         return final
