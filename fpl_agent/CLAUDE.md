@@ -51,7 +51,7 @@ Checks every 5 minutes. Tracks `last_*` dates to avoid duplicate runs.
 - **Plan files**: `data/plans/plan_*.json` - full plan details with gameweek
 - **Min gain threshold**: Only recommends transfers with >4pt net gain
 - **Hit penalty logic**: Only takes -4 hits for injuries or >8pt exceptional gains
-- **Email notifications**: Results emailed after every execution
+- **Email notifications**: Results emailed AFTER execution (not approval requests)
 
 ## Data Files
 
@@ -75,13 +75,21 @@ Checks every 5 minutes. Tracks `last_*` dates to avoid duplicate runs.
 FPL_EMAIL, FPL_PASSWORD, FPL_TEAM_ID, DRY_RUN (false), LOG_LEVEL,
 SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, NOTIFICATION_EMAIL
 
-## Current Status (Feb 2, 2026)
+## Current Status (Feb 10, 2026)
 
-- **GW24**: Deadline was Jan 31 13:30 UTC. Agent ran but old `require_approval=True` blocked execution.
-- **Mode**: Autonomous (`confirm=True`, no human approval needed)
+- **Mode**: Fully autonomous (`confirm=True`, no human approval needed)
 - **Projections loaded**: GW25-34
-- **Next action**: Agent will auto-execute at ~2h before GW25 deadline
-- **Logging fix deployed**: Awaiting verification at next 01:30 UTC price check (Feb 3)
+- **Email notifications**: Results-only (sent AFTER execution, NOT for approval)
+- **Approval workflow**: Disabled - scheduler uses `confirm=True` at `main.py:522`
+- **All critical bugs fixed**: Stale price cache, captain not set, approval blocking
+
+### How Autonomous Execution Works
+
+1. Scheduler checks every 5 minutes
+2. At 2h before GW deadline, calls `run_agent(mode='live', confirm=True)`
+3. `confirm=True` bypasses all approval prompts
+4. Agent executes transfers + lineup immediately
+5. Email sent with results (success/failure) - no confirmation needed from you
 
 ## Testing
 
