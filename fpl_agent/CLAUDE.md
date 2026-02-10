@@ -39,10 +39,28 @@ Checks every 5 minutes. Tracks `last_*` dates to avoid duplicate runs.
 
 1. Check deadline proximity
 2. Collect data (FPL API + projected_points.csv)
-3. Optimize (transfers, captain, chips)
+3. Optimize (transfers, captain, chips, lineup)
 4. Build ExecutionPlan with alerts
 5. Execute transfers + set lineup/captain/bench order via single API call
-6. Log audit trail, save state snapshots, send email notification
+6. Log audit trail, save state snapshots, send Telegram/email notification
+
+## Lineup Optimization
+
+Starting XI and bench are always optimized by expected points (`src/optimizer.py:1370-1504`):
+
+**Starting XI Selection:**
+- All players sorted by xPts per position
+- Tries all valid formations (3-4-3, 3-5-2, 4-3-3, 4-4-2, 4-5-1, 5-3-2, 5-4-1)
+- Picks formation with highest total xPts
+- Transferred-in players are always included in XI
+
+**Bench Order:**
+- Position 12: Bench GK (always)
+- Position 13: Highest xPts outfield bench player
+- Position 14: Second highest xPts
+- Position 15: Third highest xPts
+
+This ensures auto-subs bring on the best available player if a starter doesn't play.
 
 ## Safety Layers
 
