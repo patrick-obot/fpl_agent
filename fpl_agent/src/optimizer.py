@@ -168,6 +168,7 @@ class TransferOptimizer:
     MAX_HITS = 1  # Maximum hits allowed per gameweek
     MAX_FROM_TEAM = 3
     MIN_IMPROVEMENT_THRESHOLD = 4.0  # Minimum improvement to suggest transfer
+    GK_MIN_IMPROVEMENT_THRESHOLD = 8.0  # Higher threshold for GK transfers (use 2nd GK instead)
     INJURY_REPLACEMENT_THRESHOLD = 2.0  # Lower threshold for replacing injured players
     HIT_WORTHWHILE_THRESHOLD = 8.0  # Net gain must exceed this to justify a hit
 
@@ -218,6 +219,32 @@ class TransferOptimizer:
             counts[player.element_type] = counts.get(player.element_type, 0) + 1
         return counts
 
+    def _is_second_gk_playable(self) -> bool:
+        """Check if the 2nd GK is available to play (not injured/suspended)."""
+        gks = [p for p in self.current_squad if p.element_type == Position.GOALKEEPER]
+        if len(gks) < 2:
+            return False
+
+        # Sort by expected points to identify 1st and 2nd GK
+        gk_scores = []
+        for gk in gks:
+            row = self.player_df[self.player_df["player_id"] == gk.id]
+            if not row.empty:
+                availability = float(row.iloc[0].get("availability", 1.0))
+                xpts = float(row.iloc[0].get("gw1_projected", 0) or row.iloc[0].get("form", 0) or 0)
+                gk_scores.append((gk, xpts, availability))
+            else:
+                gk_scores.append((gk, 0, 1.0))
+
+        gk_scores.sort(key=lambda x: x[1], reverse=True)
+
+        # 2nd GK is playable if availability >= 75%
+        if len(gk_scores) >= 2:
+            second_gk_availability = gk_scores[1][2]
+            return second_gk_availability >= 0.75
+
+        return False
+
     def optimize(self) -> list[TransferRecommendation]:
         """
         Find optimal transfers using greedy algorithm.
@@ -231,6 +258,9 @@ class TransferOptimizer:
         )
 
         all_recommendations = []
+
+        # Check if 2nd GK is playable (for GK transfer decisions)
+        second_gk_playable = self._is_second_gk_playable()
 
         # Evaluate each player in squad for potential replacement
         for player_out in self.current_squad:
@@ -247,7 +277,20 @@ class TransferOptimizer:
                 best = candidates.iloc[0]
                 gain = best["improvement"]
 
-                if gain > self.MIN_IMPROVEMENT_THRESHOLD:
+                # Use higher threshold for GK transfers if 2nd GK is playable
+                is_gk = player_out.element_type == Position.GOALKEEPER
+                if is_gk and second_gk_playable:
+                    threshold = self.GK_MIN_IMPROVEMENT_THRESHOLD
+                    if gain <= threshold:
+                        self.logger.debug(
+                            f"Skipping GK transfer {player_out.web_name}: "
+                            f"gain {gain:.1f} <= {threshold} (2nd GK playable)"
+                        )
+                        continue
+                else:
+                    threshold = self.MIN_IMPROVEMENT_THRESHOLD
+
+                if gain > threshold:
                     recommendation = self._create_recommendation(player_out, best)
                     all_recommendations.append(recommendation)
 
