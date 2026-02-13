@@ -91,25 +91,39 @@ class FPLReviewClient:
             # the page's closures capture.
             await context.add_init_script("""() => {
                 window.__capturedCSV = null;
+                window.__csvInterceptLog = [];
 
-                // Intercept Blob constructor
+                // Helper: decode Blob parts to string (handles ArrayBuffer too)
+                function partsToString(parts) {
+                    return parts.map(p => {
+                        if (typeof p === 'string') return p;
+                        try { if (p instanceof ArrayBuffer) return new TextDecoder().decode(p); } catch(e) {}
+                        try { if (p instanceof Uint8Array) return new TextDecoder().decode(p); } catch(e) {}
+                        return '';
+                    }).join('');
+                }
+
+                // Helper: try to capture a CSV string
+                function tryCapture(content, source) {
+                    if (content && content.length > 100 && content.includes(',')) {
+                        window.__capturedCSV = content;
+                        window.__csvInterceptLog.push(source + ': ' + content.length + ' chars');
+                    }
+                }
+
+                // 1. Intercept Blob constructor
                 const OrigBlob = window.Blob;
                 window.Blob = function(parts, options) {
                     const blob = new OrigBlob(parts, options);
-                    const type = (options && options.type) || '';
-                    if (type.includes('csv') || type.includes('text/plain') || type.includes('octet')) {
-                        try {
-                            const content = parts.map(p => typeof p === 'string' ? p : '').join('');
-                            if (content.length > 50 && content.includes(',') && content.includes('\\n')) {
-                                window.__capturedCSV = content;
-                            }
-                        } catch(e) {}
-                    }
+                    try {
+                        const content = partsToString(parts);
+                        tryCapture(content, 'Blob');
+                    } catch(e) { window.__csvInterceptLog.push('Blob error: ' + e.message); }
                     return blob;
                 };
                 window.Blob.prototype = OrigBlob.prototype;
 
-                // Intercept createElement('a').click() for blob/data URL downloads
+                // 2. Intercept createElement('a') for dynamically created links
                 const origCreateElement = document.createElement.bind(document);
                 document.createElement = function(tag) {
                     const el = origCreateElement(tag);
@@ -118,18 +132,10 @@ class FPLReviewClient:
                         el.click = function() {
                             const href = el.href || '';
                             if (href.startsWith('blob:')) {
-                                fetch(href).then(r => r.text()).then(t => {
-                                    if (t.length > 50) window.__capturedCSV = t;
-                                }).catch(() => {});
+                                fetch(href).then(r => r.text()).then(t => tryCapture(t, 'createElement.blob')).catch(() => {});
                             } else if (href.startsWith('data:')) {
-                                const commaIdx = href.indexOf(',');
-                                if (commaIdx > -1) {
-                                    try {
-                                        window.__capturedCSV = decodeURIComponent(href.substring(commaIdx + 1));
-                                    } catch(e) {
-                                        window.__capturedCSV = href.substring(commaIdx + 1);
-                                    }
-                                }
+                                const ci = href.indexOf(',');
+                                if (ci > -1) try { tryCapture(decodeURIComponent(href.substring(ci+1)), 'createElement.data'); } catch(e) {}
                             }
                             return origClick();
                         };
@@ -137,19 +143,53 @@ class FPLReviewClient:
                     return el;
                 };
 
-                // Intercept URL.createObjectURL
+                // 3. Intercept click on ANY existing anchor element
+                const origAnchorClick = HTMLAnchorElement.prototype.click;
+                HTMLAnchorElement.prototype.click = function() {
+                    const href = this.href || '';
+                    if (href.startsWith('blob:')) {
+                        fetch(href).then(r => r.text()).then(t => tryCapture(t, 'anchor.blob')).catch(() => {});
+                    } else if (href.startsWith('data:')) {
+                        const ci = href.indexOf(',');
+                        if (ci > -1) try { tryCapture(decodeURIComponent(href.substring(ci+1)), 'anchor.data'); } catch(e) {}
+                    }
+                    return origAnchorClick.call(this);
+                };
+
+                // 4. Intercept URL.createObjectURL
                 const origCreateObjectURL = URL.createObjectURL.bind(URL);
                 URL.createObjectURL = function(blob) {
                     const url = origCreateObjectURL(blob);
                     if (blob instanceof Blob) {
-                        blob.text().then(t => {
-                            if (t.length > 50 && t.includes(',') && (t.includes('\\n') || t.includes('Name'))) {
-                                window.__capturedCSV = t;
-                            }
-                        }).catch(() => {});
+                        blob.text().then(t => tryCapture(t, 'createObjectURL')).catch(() => {});
                     }
                     return url;
                 };
+
+                // 5. Intercept window.open (some sites use this for downloads)
+                const origOpen = window.open;
+                window.open = function(url) {
+                    if (typeof url === 'string' && url.startsWith('data:')) {
+                        const ci = url.indexOf(',');
+                        if (ci > -1) try { tryCapture(decodeURIComponent(url.substring(ci+1)), 'window.open'); } catch(e) {}
+                    }
+                    return origOpen.apply(window, arguments);
+                };
+
+                // 6. Listen for download clicks on ANY element (capture phase)
+                document.addEventListener('click', function(e) {
+                    const a = e.target.closest('a[download], a[href^="blob:"], a[href^="data:"]');
+                    if (a) {
+                        const href = a.href || '';
+                        window.__csvInterceptLog.push('click listener: ' + href.substring(0, 80));
+                        if (href.startsWith('blob:')) {
+                            fetch(href).then(r => r.text()).then(t => tryCapture(t, 'clickListener.blob')).catch(() => {});
+                        } else if (href.startsWith('data:')) {
+                            const ci = href.indexOf(',');
+                            if (ci > -1) try { tryCapture(decodeURIComponent(href.substring(ci+1)), 'clickListener.data'); } catch(e) {}
+                        }
+                    }
+                }, true);
             }""")
 
             try:
@@ -1194,7 +1234,9 @@ class FPLReviewClient:
                 self.logger.warning(f"expect_download failed: {e}, trying fallback methods...")
 
                 # Fallback tier 1: Check JS interceptor for captured CSV content
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(3000)
+                intercept_log = await page.evaluate("() => window.__csvInterceptLog || []")
+                self.logger.info(f"JS interceptor log: {intercept_log}")
                 captured_csv = await page.evaluate("() => window.__capturedCSV")
                 if captured_csv and len(captured_csv) > 50:
                     self.logger.info(f"Captured CSV via JS interceptor ({len(captured_csv)} chars)")
@@ -1260,85 +1302,122 @@ class FPLReviewClient:
         try:
             self.logger.info("Attempting to scrape table data from DOM...")
 
-            table_data = await page.evaluate("""() => {
-                // Find the Player List table by checking header rows for
-                // player-specific column names. The Fixture Schedule table has
-                // team abbreviations and DGW probabilities - we must skip it.
-                const PLAYER_HEADERS = ['name', 'pos', 'xmins', 'total', 'price'];
+            # First, dump debug info about all tables on the page
+            debug_info = await page.evaluate("""() => {
                 const tables = document.querySelectorAll('table');
-                let bestTable = null;
-                let bestScore = 0;
-
-                for (const table of tables) {
+                const info = [];
+                tables.forEach((table, i) => {
                     const rows = table.querySelectorAll('tr');
-                    if (rows.length < 3) continue;
+                    const headerCells = rows[0] ?
+                        Array.from(rows[0].querySelectorAll('th, td')).slice(0, 8).map(c => c.textContent.trim()) : [];
+                    const sampleCells = rows[1] ?
+                        Array.from(rows[1].querySelectorAll('th, td')).slice(0, 8).map(c => c.textContent.trim()) : [];
+                    info.push('Table ' + i + ': ' + rows.length + ' rows, headers=[' +
+                        headerCells.join('|') + '], sample=[' + sampleCells.join('|') + ']');
+                });
+                return info;
+            }""")
+            for line in debug_info:
+                self.logger.info(f"  {line}")
 
-                    // Check first two rows for player-specific header keywords
-                    let headerScore = 0;
-                    for (let r = 0; r < Math.min(2, rows.length); r++) {
-                        const cells = rows[r].querySelectorAll('th, td');
+            # Strategy: find the table nearest to the "Player List" heading in the DOM
+            table_data = await page.evaluate("""() => {
+                // Helper: scrape a table to CSV string
+                function tableToCSV(table) {
+                    const result = [];
+                    const rows = table.querySelectorAll('tr');
+                    for (const row of rows) {
+                        const cells = row.querySelectorAll('th, td');
+                        const rowData = [];
                         for (const cell of cells) {
-                            const text = cell.textContent.trim().toLowerCase();
-                            for (const kw of PLAYER_HEADERS) {
-                                if (text === kw || text.includes(kw)) {
-                                    headerScore += 10;
-                                }
+                            let text = cell.textContent.trim();
+                            if (text.includes(',') || text.includes('"') || text.includes('\\n')) {
+                                text = '"' + text.replace(/"/g, '""') + '"';
                             }
-                            // Also check for currency symbol (price column)
-                            if (text.includes('\\u00a3')) headerScore += 5;
+                            rowData.push(text);
+                        }
+                        if (rowData.length > 0) result.push(rowData.join(','));
+                    }
+                    return result.length > 2 ? result.join('\\n') : null;
+                }
+
+                // Strategy 1: Walk DOM from "Player List" heading to nearest table
+                // Use TreeWalker to find text nodes with "Player List"
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                let node;
+                while (node = walker.nextNode()) {
+                    const text = node.textContent.trim();
+                    if (text === 'Player List' || text === 'Projected Points Table') {
+                        // Walk up from this text node, check sibling elements for a table
+                        let el = node.parentElement;
+                        for (let depth = 0; depth < 8 && el && el !== document.body; depth++) {
+                            // Check next siblings
+                            let sib = el.nextElementSibling;
+                            for (let s = 0; s < 10 && sib; s++) {
+                                if (sib.tagName === 'TABLE') {
+                                    const rows = sib.querySelectorAll('tr');
+                                    if (rows.length > 3) return tableToCSV(sib);
+                                }
+                                const innerTable = sib.querySelector('table');
+                                if (innerTable) {
+                                    const rows = innerTable.querySelectorAll('tr');
+                                    if (rows.length > 3) return tableToCSV(innerTable);
+                                }
+                                sib = sib.nextElementSibling;
+                            }
+                            // Move up to parent to check its siblings
+                            el = el.parentElement;
                         }
                     }
+                }
 
-                    // Check body rows for player names and data quality
+                // Strategy 2: Find table with FPL position codes (GKP/DEF/MID/FWD)
+                const POS_CODES = ['GKP', 'DEF', 'MID', 'FWD', 'GK'];
+                const tables = document.querySelectorAll('table');
+                let bestTable = null;
+                let bestPosCount = 0;
+
+                for (const table of tables) {
+                    const rows = table.querySelectorAll('tbody tr');
+                    if (rows.length < 5) continue;
+
+                    let posCount = 0;
                     let hasEmptySlot = false;
-                    let playerNameCount = 0;
-                    let dataRowCount = 0;
-                    const bodyRows = table.querySelectorAll('tbody tr');
-                    for (const row of bodyRows) {
+                    for (const row of rows) {
                         const text = row.textContent || '';
                         if (text.includes('Empty Slot')) { hasEmptySlot = true; break; }
-                        if (/\\d+\\.\\d/.test(text)) dataRowCount++;
-                        // Look for player-name-like cells (>3 chars, mostly letters,
-                        // not a short team code like MCI/CRY)
                         const cells = row.querySelectorAll('td');
                         for (const cell of cells) {
                             const ct = cell.textContent.trim();
-                            if (ct.length > 3 && /^[A-Za-z][A-Za-z .'-]+$/.test(ct)) {
-                                playerNameCount++;
-                                break;
-                            }
+                            if (POS_CODES.includes(ct)) { posCount++; break; }
                         }
                     }
-
                     if (hasEmptySlot) continue;
-
-                    // Score: header keywords strongest, then player names, then row count
-                    const score = headerScore + playerNameCount * 2 + dataRowCount;
-                    if (score > bestScore) {
-                        bestScore = score;
+                    if (posCount > bestPosCount) {
+                        bestPosCount = posCount;
                         bestTable = table;
                     }
                 }
 
-                if (!bestTable || bestScore < 3) return null;
+                if (bestTable && bestPosCount >= 5) return tableToCSV(bestTable);
 
-                const result = [];
-                const rows = bestTable.querySelectorAll('tr');
-                for (const row of rows) {
-                    const cells = row.querySelectorAll('th, td');
-                    const rowData = [];
-                    for (const cell of cells) {
-                        let text = cell.textContent.trim();
-                        if (text.includes(',') || text.includes('"') || text.includes('\\n')) {
-                            text = '"' + text.replace(/"/g, '""') + '"';
-                        }
-                        rowData.push(text);
+                // Strategy 3: Fall back to largest table without "Empty Slot"
+                let largestTable = null;
+                let maxRows = 0;
+                for (const table of tables) {
+                    const rows = table.querySelectorAll('tr');
+                    if (rows.length <= maxRows) continue;
+                    let hasEmptySlot = false;
+                    for (const row of rows) {
+                        if ((row.textContent || '').includes('Empty Slot')) { hasEmptySlot = true; break; }
                     }
-                    if (rowData.length > 0) {
-                        result.push(rowData.join(','));
-                    }
+                    if (hasEmptySlot) continue;
+                    maxRows = rows.length;
+                    largestTable = table;
                 }
-                return result.length > 2 ? result.join('\\n') : null;
+                if (largestTable && maxRows > 5) return tableToCSV(largestTable);
+
+                return null;
             }""")
 
             if not table_data:
