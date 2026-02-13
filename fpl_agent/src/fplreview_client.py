@@ -412,36 +412,49 @@ class FPLReviewClient:
     async def _handle_code_verification(self, page: Page, login_url: str) -> bool:
         """Handle Patreon's email code verification (2FA triggered from new device/IP).
 
-        When running headless, this cannot be completed automatically.
-        The user must do a one-time manual login to establish a persistent session.
+        Prompts for the code via terminal input. Use with:
+            docker compose exec -it fpl-agent python -m src.fplreview_client
+        After one successful login, the session is saved and code won't be needed again.
         """
         self.logger.info("Patreon requires email verification code")
 
-        if self._headless:
+        # Prompt for code via terminal (works with docker exec -it)
+        try:
+            code = await asyncio.to_thread(
+                input, "\nEnter the verification code sent to your email: "
+            )
+            code = code.strip()
+        except (EOFError, KeyboardInterrupt):
             self.logger.error(
-                "Cannot enter verification code in headless mode. "
-                "Run a one-time manual login to save the session:\n"
+                "No interactive terminal available for code entry. "
+                "Run one-time setup:\n"
                 "  docker compose exec -it fpl-agent python -m src.fplreview_client"
             )
             await page.screenshot(path=str(self.download_dir / "patreon_login_error.png"))
             return False
 
-        # Non-headless: wait for user to enter code in the browser window
-        self.logger.info("Please enter the verification code sent to your email...")
-        self.logger.info("Waiting up to 5 minutes for code entry...")
+        if not code:
+            self.logger.error("Empty code entered")
+            return False
 
-        for _ in range(300):  # 5 minutes
+        # Fill in the code and submit
+        code_input = page.locator('input[placeholder="Code"], input[type="text"]').first
+        await code_input.fill(code)
+        self.logger.info("Filled verification code")
+        await page.wait_for_timeout(500)
+
+        # Click Continue
+        continue_btn = page.locator('button:has-text("Continue"), button[type="submit"]').first
+        await continue_btn.click()
+        self.logger.info("Clicked Continue")
+
+        # Wait for redirect (OAuth page or fplreview)
+        self.logger.info("Waiting for redirect after code verification...")
+        for _ in range(30):
             await page.wait_for_timeout(1000)
-            # Check if we moved past the code page
-            try:
-                if not await page.locator('text="Enter your login code"').is_visible(timeout=500):
-                    break
-            except:
-                break
             if page.url != login_url:
                 break
 
-        await page.wait_for_timeout(3000)  # Wait for final redirect
         current_url = page.url
         self.logger.info(f"URL after code verification: {current_url[:120]}")
 
@@ -1206,7 +1219,7 @@ if __name__ == "__main__":
             email=config.fpl_review_email,
             password=config.fpl_review_password,
             download_dir=config.data_dir,
-            headless=False,  # Set to False for debugging
+            headless=True,  # Headless works in Docker; code entry via terminal input
             logger=config.logger,
             team_id=str(config.fpl_team_id),
         )
