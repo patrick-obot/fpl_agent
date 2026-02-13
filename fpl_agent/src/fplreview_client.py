@@ -231,6 +231,9 @@ class FPLReviewClient:
             if not await self._handle_cloudflare(page):
                 return False
 
+            # Dismiss any cookie consent popups (Transcend manager)
+            await self._accept_cookies(page)
+
             self.logger.info("Completing Patreon login form...")
 
             # Step 1: Wait for and fill email input
@@ -316,9 +319,12 @@ class FPLReviewClient:
             await password_input.fill(self.password)
             self.logger.info("Filled password")
 
+            # Dismiss any consent popups before clicking login
+            await self._accept_cookies(page)
+
             # Step 5: Click login/submit button
             login_btn = page.locator('button:has-text("Log in"), button:has-text("Login"), button[type="submit"]').first
-            await login_btn.click()
+            await login_btn.click(force=True)  # force=True bypasses intercepting elements
             self.logger.info("Clicked login button")
 
             # Step 6: Wait for redirect back to FPL Review
@@ -352,8 +358,45 @@ class FPLReviewClient:
             return False
 
     async def _accept_cookies(self, page: Page) -> None:
-        """Accept cookie consent popup if present."""
+        """Accept cookie consent popup if present (including Transcend consent manager)."""
         try:
+            # First try to dismiss Transcend consent manager (Patreon uses this)
+            transcend_selectors = [
+                '#transcend-consent-manager button:has-text("Accept")',
+                '#transcend-consent-manager button:has-text("Accept All")',
+                '[data-testid="consent-manager-accept"]',
+                'button[class*="accept"]',
+                '#transcend-consent-manager [role="button"]',
+            ]
+            for selector in transcend_selectors:
+                try:
+                    btn = page.locator(selector).first
+                    if await btn.is_visible(timeout=2000):
+                        await btn.click(force=True)
+                        self.logger.info(f"Dismissed Transcend consent via {selector}")
+                        await page.wait_for_timeout(1000)
+                        return
+                except:
+                    continue
+
+            # Try to remove Transcend overlay via JavaScript if clicking fails
+            try:
+                removed = await page.evaluate("""() => {
+                    const overlay = document.querySelector('#transcend-consent-manager');
+                    if (overlay) {
+                        overlay.remove();
+                        return true;
+                    }
+                    return false;
+                }""")
+                if removed:
+                    self.logger.info("Removed Transcend consent manager via JS")
+                    await page.wait_for_timeout(500)
+                    return
+            except:
+                pass
+
+            # Standard cookie consent selectors
             cookie_selectors = [
                 'button:has-text("Accept All")',
                 'button:has-text("Accept")',
