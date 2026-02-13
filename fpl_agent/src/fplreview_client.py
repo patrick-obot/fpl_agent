@@ -656,9 +656,9 @@ class FPLReviewClient:
         await page.wait_for_timeout(5000)
         await self._wait_for_table_data(page)
 
-    async def _wait_for_table_data(self, page: Page, timeout_s: int = 30) -> bool:
+    async def _wait_for_table_data(self, page: Page, timeout_s: int = 30, min_rows: int = 5) -> bool:
         """Poll for table rows to appear in the DOM. Returns True if data found."""
-        self.logger.info("Waiting for table data to appear...")
+        self.logger.info(f"Waiting for table data to appear (min {min_rows} rows)...")
 
         table_row_selectors = [
             'table tbody tr',
@@ -673,7 +673,7 @@ class FPLReviewClient:
             for selector in table_row_selectors:
                 try:
                     count = await page.locator(selector).count()
-                    if count > 2:  # More than header rows
+                    if count >= min_rows:
                         self.logger.info(f"Table data found: {count} rows via '{selector}'")
                         return True
                 except:
@@ -723,50 +723,91 @@ class FPLReviewClient:
                 await page.evaluate("window.scrollBy(0, 400)")
                 await page.wait_for_timeout(300)
 
-            # Try to expand/load the player list if there's a button for it
+            # Try to expand/load the player list if there's a button or tab for it
             try:
-                player_list_btn = page.locator('text="Player List", button:has-text("Player"), :text("Load")').first
-                if await player_list_btn.is_visible(timeout=2000):
-                    self.logger.info("Clicking Player List to expand data...")
-                    await player_list_btn.click()
-                    await page.wait_for_timeout(5000)
+                # Look for tabs or buttons that might show full player data
+                player_list_selectors = [
+                    'text="Player List"',
+                    'text="All Players"',
+                    'button:has-text("Player")',
+                    'a:has-text("Player List")',
+                    '[class*="tab"]:has-text("Player")',
+                    'text="Show All"',
+                ]
+                for selector in player_list_selectors:
+                    try:
+                        btn = page.locator(selector).first
+                        if await btn.is_visible(timeout=2000):
+                            self.logger.info(f"Clicking to expand player data: {selector}")
+                            await btn.click()
+                            await page.wait_for_timeout(3000)
+                            break
+                    except:
+                        continue
             except:
                 pass
 
-            # Look specifically for "Download Data (CSV)" button
-            download_selectors = [
-                'a:has-text("Download Data (CSV)")',
-                'button:has-text("Download Data (CSV)")',
-                'a:has-text("Download Data")',
-                'button:has-text("Download Data")',
-                'a:has-text("Download CSV")',
-                'button:has-text("Download CSV")',
-                'a:has-text("download csv")',
-                'button:has-text("download csv")',
-                'a:has-text("CSV")',
-                'button:has-text("CSV")',
-                '[download*=".csv"]',
-                'a[href*=".csv"]',
-            ]
+            # Scroll through page to trigger lazy loading
+            self.logger.info("Scrolling to trigger lazy loading...")
+            for _ in range(5):
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(1000)
 
+            # Look specifically for "Download Data (CSV)" button - be very specific
             self.logger.info("Looking for CSV download button...")
             download_btn = None
-            for selector in download_selectors:
-                try:
-                    elements = page.locator(selector)
-                    count = await elements.count()
-                    if count > 0:
-                        for i in range(count):
-                            btn = elements.nth(i)
-                            if await btn.is_visible(timeout=1000):
-                                text = await btn.text_content()
-                                self.logger.info(f"Found element with selector '{selector}': {text}")
-                                download_btn = btn
-                                break
-                    if download_btn:
-                        break
-                except:
-                    continue
+
+            # First, try to find by exact text match using JavaScript
+            try:
+                download_link = await page.evaluate("""() => {
+                    const links = document.querySelectorAll('a');
+                    for (const link of links) {
+                        const text = link.textContent.trim();
+                        if (text === 'Download Data (CSV)' || text === 'Download CSV') {
+                            return true;
+                        }
+                    }
+                    return false;
+                }""")
+                if download_link:
+                    # Use text-is for exact match
+                    download_btn = page.locator('a:text-is("Download Data (CSV)")').first
+                    if not await download_btn.is_visible(timeout=2000):
+                        download_btn = page.locator('a:text-is("Download CSV")').first
+                    self.logger.info("Found download button via exact text match")
+            except:
+                pass
+
+            # Fallback to pattern matching, but filter out Upload buttons
+            if not download_btn:
+                download_selectors = [
+                    'a:has-text("Download Data")',
+                    'button:has-text("Download Data")',
+                    'a:has-text("Download CSV")',
+                    'button:has-text("Download CSV")',
+                    '[download*=".csv"]',
+                    'a[href*=".csv"]',
+                ]
+
+                for selector in download_selectors:
+                    try:
+                        elements = page.locator(selector)
+                        count = await elements.count()
+                        if count > 0:
+                            for i in range(count):
+                                btn = elements.nth(i)
+                                if await btn.is_visible(timeout=1000):
+                                    text = (await btn.text_content() or "").strip()
+                                    # Skip if it contains "Upload"
+                                    if "upload" in text.lower():
+                                        continue
+                                    self.logger.info(f"Found element with selector '{selector}': {text[:50]}")
+                                    download_btn = btn
+                                    break
+                        if download_btn:
+                            break
+                    except:
+                        continue
 
             if not download_btn:
                 # No download button - try DOM scrape as last resort
