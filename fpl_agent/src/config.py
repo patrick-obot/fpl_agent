@@ -79,6 +79,13 @@ class Config:
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
+    # Twitter/X API Settings
+    x_bearer_token: str = ""
+
+    # FPL Review / Patreon Credentials
+    fpl_review_email: str = ""
+    fpl_review_password: str = ""
+
     # Paths
     project_root: Path = field(default_factory=lambda: Path(__file__).parent.parent)
     data_dir: Path = field(init=False)
@@ -155,6 +162,9 @@ class Config:
             smtp_password=os.getenv("SMTP_PASSWORD", ""),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
+            x_bearer_token=os.getenv("X_BEARER_TOKEN", ""),
+            fpl_review_email=os.getenv("FPL_REVIEW_EMAIL", ""),
+            fpl_review_password=os.getenv("FPL_REVIEW_PASSWORD", ""),
             project_root=project_root,
         )
 

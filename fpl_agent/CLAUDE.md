@@ -8,10 +8,14 @@ Autonomous Fantasy Premier League agent. Collects player data, optimizes transfe
 
 ```
 main.py          CLI entry point + scheduler daemon + orchestration
+update_projections.py  Download projections from FPL Review + deploy
 src/
   config.py      Config from .env (credentials, thresholds, paths)
   fpl_client.py  Async FPL API client (rate-limited, cached, retry logic)
+  fplreview_client.py  Automated FPL Review CSV download via Patreon OAuth
   data_collector.py  Fixture difficulty, player news, projected points
+  twitter_collector.py  Twitter/X API client for @robtFPL data (future)
+  image_ocr.py   OCR extraction from tweet images (team odds)
   optimizer.py   Transfer + captain recommendations (constraint solver)
   executor.py    Safe execution: dry-run, audit trail, state snapshots, rollback
 ```
@@ -24,6 +28,11 @@ python main.py --mode live --confirm  # Live execution
 python main.py schedule               # Scheduler daemon
 python main.py price-check            # Price monitoring only
 python main.py approve <plan_id>      # Approve pending plan (not used in autonomous mode)
+
+# Projection updates
+python update_projections.py          # Download from FPL Review + commit + deploy
+python update_projections.py --skip-download  # Use existing CSV, just deploy
+python update_projections.py --skip-deploy    # Download only, no deployment
 ```
 
 ## Scheduler
@@ -73,12 +82,14 @@ This ensures auto-subs bring on the best available player if a starter doesn't p
 
 ## Data Files
 
-- `data/projected_points.csv` - External projections (GW26-35, manually uploaded)
+- `data/projected_points.csv` - FPL Review projections (auto-downloaded via Patreon)
 - `data/data_cache.pkl` - 5-min API response cache
 - `data/audit_trail.json` - Decision audit log
 - `data/plans/*.json` - Execution plan history
 - `data/states/*.json` - Team state snapshots
 - `data/price_changes_*.csv` - Daily price reports
+- `data/browser_profile/` - Playwright browser state for FPL Review login
+- `data/*.png` - Debug screenshots from FPL Review download attempts
 
 ## Deployment (VPS with Docker)
 
@@ -120,6 +131,8 @@ See `.env.example` for full list. Required:
 - `DRY_RUN=false` - Enable live execution
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` - Telegram notifications (recommended)
 - `SMTP_*`, `NOTIFICATION_EMAIL` - Email notifications (optional fallback)
+- `FPL_REVIEW_EMAIL`, `FPL_REVIEW_PASSWORD` - Patreon credentials for FPL Review access
+- `X_BEARER_TOKEN` - Twitter API Bearer Token (future: team odds data)
 
 ## Railway Backup
 
@@ -148,14 +161,15 @@ Railway config files are kept as backup in case of fallback:
 - If no DGWs remaining and chips available, still uses expected points for decisions
 - BB vs TC compared purely on xPts, recommends whichever is higher
 
-## Current Status (Feb 10, 2026)
+## Current Status (Feb 13, 2026)
 
 - **Mode**: Fully autonomous (`confirm=True`, no human approval needed)
-- **Projections loaded**: GW26-35
+- **Projections**: Auto-downloaded from FPL Review via Patreon OAuth
 - **Notifications**: Telegram (primary) + Email (fallback), sent AFTER execution
 - **Approval workflow**: Disabled - scheduler uses `confirm=True` at `main.py:522`
 - **All critical bugs fixed**: Stale price cache, captain not set, approval blocking
 - **Chip strategy**: Proactive WC for DGW prep, BB vs TC by xPts, GW38 urgency
+- **FPL Review integration**: Automated CSV download with Telegram notifications
 
 ### How Autonomous Execution Works
 
@@ -183,6 +197,28 @@ pytest tests/ -v --cov=src      # With coverage
 ---
 
 ## Change Log
+
+### Feb 13, 2026 - Session 5: FPL Review automation + Twitter/OCR groundwork
+
+- **FPL Review Client** (`src/fplreview_client.py`): Automated CSV download via Patreon OAuth
+  - Uses Playwright headless browser to login via Patreon
+  - Handles OAuth flow, cookie consent, page navigation
+  - Downloads `projected_points.csv` from Free Planner page
+  - Multiple fallbacks: expect_download, JS interceptor, DOM scrape
+  - Saves debug screenshots on failure for troubleshooting
+- **update_projections.py**: Updated to use automated download
+  - `python update_projections.py` - full workflow: download + commit + deploy
+  - `--skip-download` - use existing CSV
+  - `--skip-deploy` - download only
+  - **Telegram notifications** on download success/failure
+- **Twitter/OCR modules** (groundwork for future):
+  - `src/twitter_collector.py`: Fetch tweets from @robtFPL via Twitter API v2
+  - `src/image_ocr.py`: OCR extraction from tweet images using easyocr
+  - Extracts team projected goals and clean sheet odds (GW-aware)
+  - Player projections extraction limited by image complexity
+  - **Deferred**: Twitter integration pending next phase
+- **Config updates**: Added `fpl_review_email`, `fpl_review_password`, `x_bearer_token`
+- **Dependencies**: Added `tweepy>=4.14.0`, `easyocr` to requirements.txt
 
 ### Feb 10, 2026 - Session 4: Proactive chip strategy + BB vs TC logic
 

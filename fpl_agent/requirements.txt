@@ -17,6 +17,9 @@ lxml>=4.9.0
 # RSS feed parsing
 feedparser>=6.0.0
 
+# Twitter/X API
+tweepy>=4.14.0
+
 # Rate limiting
 aiolimiter>=1.1.0
 

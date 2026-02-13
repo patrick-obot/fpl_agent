@@ -19,6 +19,8 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
+import aiohttp
+
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
@@ -27,6 +29,33 @@ from fplreview_client import download_fplreview_projections
 
 
 PROJECT_DIR = Path(__file__).parent
+
+
+async def send_telegram_notification(config: Config, message: str) -> bool:
+    """Send a Telegram notification."""
+    if not config.telegram_bot_token or not config.telegram_chat_id:
+        print("Telegram not configured, skipping notification")
+        return False
+
+    url = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage"
+    payload = {
+        "chat_id": config.telegram_chat_id,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=30) as response:
+                if response.status == 200:
+                    print("Telegram notification sent")
+                    return True
+                else:
+                    print(f"Telegram API error: {response.status}")
+                    return False
+    except Exception as e:
+        print(f"Telegram notification failed: {e}")
+        return False
 DATA_FILE = PROJECT_DIR / "data" / "projected_points.csv"
 
 
@@ -41,6 +70,10 @@ async def download_projections(config: Config) -> bool:
         print("Add the following to your .env file:")
         print("  FPL_REVIEW_EMAIL=your_patreon_email")
         print("  FPL_REVIEW_PASSWORD=your_patreon_password")
+        await send_telegram_notification(
+            config,
+            "❌ <b>FPL Review Download Failed</b>\n\nCredentials not configured."
+        )
         return False
 
     csv_path = await download_fplreview_projections(
@@ -53,11 +86,29 @@ async def download_projections(config: Config) -> bool:
     )
 
     if csv_path and csv_path.exists():
+        file_size = csv_path.stat().st_size
         print(f"Download successful: {csv_path}")
+
+        # Send success notification
+        await send_telegram_notification(
+            config,
+            f"✅ <b>FPL Review Projections Downloaded</b>\n\n"
+            f"📁 File: projected_points.csv\n"
+            f"📊 Size: {file_size:,} bytes\n"
+            f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        )
         return True
     else:
         print("ERROR: Download failed!")
         print("Check the screenshots in data/ folder for debugging.")
+
+        # Send failure notification
+        await send_telegram_notification(
+            config,
+            f"❌ <b>FPL Review Download Failed</b>\n\n"
+            f"Check screenshots in data/ folder.\n"
+            f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        )
         return False
 
 
