@@ -3,14 +3,14 @@
 FPL Projections Updater
 
 Automatically downloads projected_points.csv from FPL Review via Patreon,
-then commits and deploys to Railway.
+then commits and pushes to git.
 
 Usage:
-    python update_projections.py [--skip-download] [--skip-deploy]
+    python update_projections.py [--skip-download] [--skip-commit]
 
 Options:
     --skip-download  Skip the automatic download (use existing file)
-    --skip-deploy    Skip Railway deployment (just download and commit)
+    --skip-commit    Skip git commit and push (just download)
 """
 
 import asyncio
@@ -183,36 +183,10 @@ def git_commit_and_push() -> bool:
     return True
 
 
-def deploy_to_railway() -> bool:
-    """Deploy to Railway."""
-    print()
-    print("Deploying to Railway...")
-    try:
-        result = subprocess.run(
-            ["railway", "up", "--service", "fpl-agent"],
-            cwd=PROJECT_DIR,
-            capture_output=True,
-            text=True,
-            timeout=300
-        )
-        if result.returncode != 0:
-            print(f"Railway deploy failed: {result.stderr}")
-            return False
-        print("Deployed!")
-        return True
-    except FileNotFoundError:
-        print("WARNING: Railway CLI not found. Skipping deployment.")
-        print("Install with: npm install -g @railway/cli")
-        return True  # Don't fail the script if Railway isn't installed
-    except subprocess.TimeoutExpired:
-        print("ERROR: Railway deployment timed out.")
-        return False
-
-
 async def main():
     # Parse command line arguments
     skip_download = "--skip-download" in sys.argv
-    skip_deploy = "--skip-deploy" in sys.argv
+    skip_commit = "--skip-commit" in sys.argv
 
     print("=" * 60)
     print("FPL PROJECTIONS UPDATER")
@@ -234,18 +208,14 @@ async def main():
     if not show_file_info():
         return 1
 
-    # Step 3: Git commit and push
-    if not git_commit_and_push():
-        return 1
-
-    # Step 4: Deploy to Railway (unless skipped)
-    if not skip_deploy:
-        if not deploy_to_railway():
+    # Step 3: Git commit and push (unless skipped)
+    if not skip_commit:
+        if not git_commit_and_push():
             return 1
 
     print()
     print("=" * 60)
-    print("SUCCESS! Projections updated and deployed.")
+    print("SUCCESS! Projections updated.")
     print("=" * 60)
     return 0
 

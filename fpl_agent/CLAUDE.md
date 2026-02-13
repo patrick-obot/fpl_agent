@@ -30,9 +30,9 @@ python main.py price-check            # Price monitoring only
 python main.py approve <plan_id>      # Approve pending plan (not used in autonomous mode)
 
 # Projection updates
-python update_projections.py          # Download from FPL Review + commit + deploy
-python update_projections.py --skip-download  # Use existing CSV, just deploy
-python update_projections.py --skip-deploy    # Download only, no deployment
+python update_projections.py              # Download from FPL Review + git commit/push
+python update_projections.py --skip-download  # Use existing CSV, just commit/push
+python update_projections.py --skip-commit    # Download only, no git operations
 ```
 
 ## Scheduler
