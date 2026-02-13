@@ -63,13 +63,12 @@ class FPLReviewClient:
             return None
 
         self.download_dir.mkdir(parents=True, exist_ok=True)
+        self._headless = headless
 
-        # Clear browser profile to force fresh OAuth flow each time
-        # The OAuth "Allow" click is required to enable premium features
+        # Persist browser profile to maintain Patreon login session across runs
+        # (avoids email code verification on every run from VPS)
+        # Delete data/browser_profile/ manually if session becomes corrupted
         user_data_dir = self.download_dir / "browser_profile"
-        if user_data_dir.exists():
-            import shutil
-            shutil.rmtree(user_data_dir, ignore_errors=True)
         user_data_dir.mkdir(parents=True, exist_ok=True)
 
         async with async_playwright() as p:
@@ -342,38 +341,43 @@ class FPLReviewClient:
             await password_input.press("Enter")
             self.logger.info("Pressed Enter to submit")
 
-            # Step 6: Wait for URL to change (OAuth page or fplreview redirect)
-            self.logger.info("Waiting for redirect...")
+            # Step 6: Wait for response (URL change, code verification, or error)
+            self.logger.info("Waiting for login response...")
             redirected = False
-            for _ in range(30):
+            for _ in range(15):
                 await page.wait_for_timeout(1000)
+                # Check for URL change (redirect to OAuth or fplreview)
                 if page.url != login_url:
                     redirected = True
                     break
+                # Check for email code verification page (Patreon 2FA from new device)
+                try:
+                    if await page.locator('text="Enter your login code"').is_visible(timeout=500):
+                        return await self._handle_code_verification(page, login_url)
+                except:
+                    pass
 
             if not redirected:
                 # Fallback: try clicking Continue/submit button
-                self.logger.warning("No redirect after Enter, trying button click...")
+                self.logger.warning("No response after Enter, trying button click...")
                 try:
                     submit_btn = page.locator('button[type="submit"], button:has-text("Continue")').first
                     await submit_btn.click(force=True)
-                    for _ in range(15):
+                    for _ in range(10):
                         await page.wait_for_timeout(1000)
                         if page.url != login_url:
                             redirected = True
                             break
+                        try:
+                            if await page.locator('text="Enter your login code"').is_visible(timeout=500):
+                                return await self._handle_code_verification(page, login_url)
+                        except:
+                            pass
                 except:
                     pass
 
             if not redirected:
                 self.logger.error("Login did not redirect - check credentials or CAPTCHA")
-                try:
-                    error_el = page.locator('[class*="error"], [role="alert"]').first
-                    if await error_el.is_visible(timeout=2000):
-                        error_msg = await error_el.text_content()
-                        self.logger.error(f"Login error: {error_msg}")
-                except:
-                    pass
                 await page.screenshot(path=str(self.download_dir / "patreon_login_error.png"))
                 return False
 
@@ -404,6 +408,62 @@ class FPLReviewClient:
             self.logger.error(f"Error completing Patreon login: {e}")
             await page.screenshot(path=str(self.download_dir / "patreon_login_error.png"))
             return False
+
+    async def _handle_code_verification(self, page: Page, login_url: str) -> bool:
+        """Handle Patreon's email code verification (2FA triggered from new device/IP).
+
+        When running headless, this cannot be completed automatically.
+        The user must do a one-time manual login to establish a persistent session.
+        """
+        self.logger.info("Patreon requires email verification code")
+
+        if self._headless:
+            self.logger.error(
+                "Cannot enter verification code in headless mode. "
+                "Run a one-time manual login to save the session:\n"
+                "  docker compose exec -it fpl-agent python -m src.fplreview_client"
+            )
+            await page.screenshot(path=str(self.download_dir / "patreon_login_error.png"))
+            return False
+
+        # Non-headless: wait for user to enter code in the browser window
+        self.logger.info("Please enter the verification code sent to your email...")
+        self.logger.info("Waiting up to 5 minutes for code entry...")
+
+        for _ in range(300):  # 5 minutes
+            await page.wait_for_timeout(1000)
+            # Check if we moved past the code page
+            try:
+                if not await page.locator('text="Enter your login code"').is_visible(timeout=500):
+                    break
+            except:
+                break
+            if page.url != login_url:
+                break
+
+        await page.wait_for_timeout(3000)  # Wait for final redirect
+        current_url = page.url
+        self.logger.info(f"URL after code verification: {current_url[:120]}")
+
+        if self._is_fplreview_url(current_url):
+            self.logger.info("Successfully logged in after code verification")
+            return True
+
+        # Check for OAuth allow page
+        if self._is_patreon_url(current_url):
+            try:
+                auth_btn = page.locator('button:has-text("Allow"), button:has-text("Authorize")').first
+                if await auth_btn.is_visible(timeout=5000):
+                    await auth_btn.click()
+                    self.logger.info("Clicked authorize button")
+                    for _ in range(15):
+                        await page.wait_for_timeout(1000)
+                        if self._is_fplreview_url(page.url):
+                            return True
+            except:
+                pass
+
+        return self._is_fplreview_url(page.url)
 
     async def _accept_cookies(self, page: Page) -> None:
         """Accept cookie consent popup if present (including Transcend consent manager)."""
