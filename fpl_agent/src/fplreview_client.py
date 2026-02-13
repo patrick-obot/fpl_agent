@@ -195,8 +195,13 @@ class FPLReviewClient:
             self.logger.info(f"Current URL after click: {current_url}")
 
             if self._is_patreon_url(current_url):
-                # We're on Patreon login page
-                return await self._complete_patreon_login(page)
+                if "/oauth2/" in current_url or "authorize" in current_url:
+                    # OAuth authorization page (already logged in, session saved)
+                    self.logger.info("On OAuth authorization page, clicking Allow...")
+                    return await self._handle_oauth_allow(page)
+                else:
+                    # Login page - need email + password
+                    return await self._complete_patreon_login(page)
             elif self._is_fplreview_url(current_url):
                 # We were already logged in and got redirected back
                 self.logger.info("Already authenticated via Patreon (redirected back to FPL Review)")
@@ -208,6 +213,26 @@ class FPLReviewClient:
 
         except Exception as e:
             self.logger.error(f"Error during Patreon login: {e}")
+            return False
+
+    async def _handle_oauth_allow(self, page: Page) -> bool:
+        """Click Allow on the Patreon OAuth authorization page."""
+        try:
+            allow_btn = page.locator('button:has-text("Allow"), button:has-text("Authorize")').first
+            if await allow_btn.is_visible(timeout=5000):
+                await allow_btn.click()
+                self.logger.info("Clicked Allow on OAuth page")
+                # Wait for redirect back to FPL Review
+                for _ in range(15):
+                    await page.wait_for_timeout(1000)
+                    if self._is_fplreview_url(page.url):
+                        self.logger.info("Successfully authorized and redirected to FPL Review")
+                        return True
+            self.logger.warning(f"OAuth Allow not completed, URL: {page.url[:100]}")
+            return self._is_fplreview_url(page.url)
+        except Exception as e:
+            self.logger.error(f"Error handling OAuth allow: {e}")
+            await page.screenshot(path=str(self.download_dir / "oauth_error.png"))
             return False
 
     async def _handle_cloudflare(self, page: Page) -> bool:
