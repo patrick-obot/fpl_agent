@@ -2,82 +2,51 @@
 """
 FPL Projections Updater
 
-Automatically downloads projected_points.csv from FPL Review via Patreon,
-then commits and deploys to Railway.
+After manually downloading projected_points.csv from FPL Review,
+run this script to commit and deploy to Railway.
 
 Usage:
-    python update_projections.py [--skip-download] [--skip-deploy]
-
-Options:
-    --skip-download  Skip the automatic download (use existing file)
-    --skip-deploy    Skip Railway deployment (just download and commit)
+    1. Download CSV from https://fplreview.com/massive-data-planner23/
+    2. Save as: fpl_agent/data/projected_points.csv
+    3. Run: python update_projections.py
 """
 
-import asyncio
 import subprocess
 import sys
 from pathlib import Path
 from datetime import datetime
-
-# Add src to path for imports
-sys.path.insert(0, str(Path(__file__).parent / "src"))
-
-from config import Config
-from fplreview_client import download_fplreview_projections
 
 
 PROJECT_DIR = Path(__file__).parent
 DATA_FILE = PROJECT_DIR / "data" / "projected_points.csv"
 
 
-async def download_projections(config: Config) -> bool:
-    """Download projections CSV from FPL Review."""
-    print("Downloading projections from FPL Review...")
+def main():
+    print("=" * 60)
+    print("FPL PROJECTIONS UPDATER")
+    print("=" * 60)
+    print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
 
-    if not config.fpl_review_email or not config.fpl_review_password:
-        print("ERROR: FPL_REVIEW_EMAIL and FPL_REVIEW_PASSWORD must be set in .env")
-        print()
-        print("Add the following to your .env file:")
-        print("  FPL_REVIEW_EMAIL=your_patreon_email")
-        print("  FPL_REVIEW_PASSWORD=your_patreon_password")
-        return False
-
-    csv_path = await download_fplreview_projections(
-        email=config.fpl_review_email,
-        password=config.fpl_review_password,
-        download_dir=config.data_dir,
-        headless=True,
-        logger=config.logger,
-        team_id=str(config.fpl_team_id),
-    )
-
-    if csv_path and csv_path.exists():
-        print(f"Download successful: {csv_path}")
-        return True
-    else:
-        print("ERROR: Download failed!")
-        print("Check the screenshots in data/ folder for debugging.")
-        return False
-
-
-def show_file_info():
-    """Display information about the CSV file."""
+    # Check if file exists
     if not DATA_FILE.exists():
         print(f"ERROR: {DATA_FILE} not found!")
-        return False
+        print()
+        print("Please download the CSV from FPL Review first:")
+        print("  1. Go to https://fplreview.com/massive-data-planner23/")
+        print("  2. Log in with Patreon")
+        print("  3. Click 'Download CSV'")
+        print(f"  4. Save as: {DATA_FILE}")
+        return 1
 
+    # Show file info
     file_size = DATA_FILE.stat().st_size
     file_modified = datetime.fromtimestamp(DATA_FILE.stat().st_mtime)
     print(f"File: {DATA_FILE.name}")
     print(f"Size: {file_size:,} bytes")
     print(f"Modified: {file_modified.strftime('%Y-%m-%d %H:%M:%S')}")
     print()
-    return True
 
-
-def git_commit_and_push() -> bool:
-    """Add, commit, and push the CSV file to git."""
     # Git add
     print("Adding to git...")
     result = subprocess.run(
@@ -88,7 +57,7 @@ def git_commit_and_push() -> bool:
     )
     if result.returncode != 0:
         print(f"Git add failed: {result.stderr}")
-        return False
+        return 1
 
     # Check if there are changes to commit
     result = subprocess.run(
@@ -100,97 +69,49 @@ def git_commit_and_push() -> bool:
 
     if not result.stdout.strip():
         print("No changes to commit - file is already up to date.")
-        return True
-
-    # Git commit
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    print("Committing...")
-    result = subprocess.run(
-        ["git", "commit", "-m", f"Update projected_points.csv ({timestamp})"],
-        cwd=PROJECT_DIR,
-        capture_output=True,
-        text=True
-    )
-    if result.returncode != 0 and "nothing to commit" not in result.stdout:
-        print(f"Git commit failed: {result.stderr}")
-        return False
-    print("Committed!")
-
-    # Git push
-    print("Pushing to origin...")
-    result = subprocess.run(
-        ["git", "push"],
-        cwd=PROJECT_DIR,
-        capture_output=True,
-        text=True
-    )
-    if result.returncode != 0:
-        print(f"Git push failed: {result.stderr}")
-        return False
-    print("Pushed!")
-
-    return True
-
-
-def deploy_to_railway() -> bool:
-    """Deploy to Railway."""
-    print()
-    print("Deploying to Railway...")
-    try:
+        print()
+        print("Deploying to Railway anyway...")
+    else:
+        # Git commit
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        print(f"Committing...")
         result = subprocess.run(
-            ["railway", "up", "--service", "fpl-agent"],
+            ["git", "commit", "-m", f"Update projected_points.csv ({timestamp})"],
             cwd=PROJECT_DIR,
             capture_output=True,
-            text=True,
-            timeout=300
+            text=True
+        )
+        if result.returncode != 0 and "nothing to commit" not in result.stdout:
+            print(f"Git commit failed: {result.stderr}")
+            return 1
+        print("Committed!")
+
+        # Git push
+        print("Pushing to origin...")
+        result = subprocess.run(
+            ["git", "push"],
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            text=True
         )
         if result.returncode != 0:
-            print(f"Railway deploy failed: {result.stderr}")
-            return False
-        print("Deployed!")
-        return True
-    except FileNotFoundError:
-        print("WARNING: Railway CLI not found. Skipping deployment.")
-        print("Install with: npm install -g @railway/cli")
-        return True  # Don't fail the script if Railway isn't installed
-    except subprocess.TimeoutExpired:
-        print("ERROR: Railway deployment timed out.")
-        return False
+            print(f"Git push failed: {result.stderr}")
+            return 1
+        print("Pushed!")
 
-
-async def main():
-    # Parse command line arguments
-    skip_download = "--skip-download" in sys.argv
-    skip_deploy = "--skip-deploy" in sys.argv
-
-    print("=" * 60)
-    print("FPL PROJECTIONS UPDATER")
-    print("=" * 60)
-    print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    # Deploy to Railway
     print()
-
-    # Load config
-    config = Config.from_env()
-
-    # Step 1: Download projections (unless skipped)
-    if not skip_download:
-        success = await download_projections(config)
-        if not success:
-            return 1
-        print()
-
-    # Step 2: Verify file exists and show info
-    if not show_file_info():
+    print("Deploying to Railway...")
+    result = subprocess.run(
+        ["railway", "up", "--service", "fpl-agent"],
+        cwd=PROJECT_DIR,
+        capture_output=True,
+        text=True,
+        timeout=300
+    )
+    if result.returncode != 0:
+        print(f"Railway deploy failed: {result.stderr}")
         return 1
-
-    # Step 3: Git commit and push
-    if not git_commit_and_push():
-        return 1
-
-    # Step 4: Deploy to Railway (unless skipped)
-    if not skip_deploy:
-        if not deploy_to_railway():
-            return 1
 
     print()
     print("=" * 60)
@@ -200,4 +121,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    sys.exit(main())
