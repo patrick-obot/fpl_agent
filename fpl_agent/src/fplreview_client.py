@@ -85,112 +85,35 @@ class FPLReviewClient:
             )
             page = context.pages[0] if context.pages else await context.new_page()
 
-            # Inject CSV interceptor BEFORE any page loads via add_init_script.
-            # This runs in every new document context before the page's own JS,
-            # so our patched Blob/createElement/createObjectURL are the ones
-            # the page's closures capture.
-            await context.add_init_script("""() => {
-                window.__capturedCSV = null;
-                window.__csvInterceptLog = [];
+            # ── Network response interception (Plan B) ──
+            # Capture ALL HTTP responses from fplreview.com that might
+            # contain player projection data (JSON/CSV/text).
+            self._captured_responses = []
 
-                // Helper: decode Blob parts to string (handles ArrayBuffer too)
-                function partsToString(parts) {
-                    return parts.map(p => {
-                        if (typeof p === 'string') return p;
-                        try { if (p instanceof ArrayBuffer) return new TextDecoder().decode(p); } catch(e) {}
-                        try { if (p instanceof Uint8Array) return new TextDecoder().decode(p); } catch(e) {}
-                        return '';
-                    }).join('');
-                }
+            async def _capture_response(response):
+                try:
+                    url = response.url
+                    if 'fplreview' not in url:
+                        return
+                    ct = response.headers.get('content-type', '')
+                    if not any(t in ct for t in ['json', 'text', 'csv', 'javascript']):
+                        return
+                    if response.status != 200:
+                        return
+                    body = await response.text()
+                    if len(body) < 200:
+                        return
+                    self._captured_responses.append({
+                        'url': url,
+                        'content_type': ct,
+                        'body': body,
+                        'size': len(body),
+                    })
+                    self.logger.info(f"  [NET] Captured: {url[:100]} ({len(body):,} bytes, {ct[:30]})")
+                except Exception:
+                    pass
 
-                // Helper: try to capture a CSV string
-                function tryCapture(content, source) {
-                    if (content && content.length > 100 && content.includes(',')) {
-                        window.__capturedCSV = content;
-                        window.__csvInterceptLog.push(source + ': ' + content.length + ' chars');
-                    }
-                }
-
-                // 1. Intercept Blob constructor
-                const OrigBlob = window.Blob;
-                window.Blob = function(parts, options) {
-                    const blob = new OrigBlob(parts, options);
-                    try {
-                        const content = partsToString(parts);
-                        tryCapture(content, 'Blob');
-                    } catch(e) { window.__csvInterceptLog.push('Blob error: ' + e.message); }
-                    return blob;
-                };
-                window.Blob.prototype = OrigBlob.prototype;
-
-                // 2. Intercept createElement('a') for dynamically created links
-                const origCreateElement = document.createElement.bind(document);
-                document.createElement = function(tag) {
-                    const el = origCreateElement(tag);
-                    if (tag.toLowerCase() === 'a') {
-                        const origClick = el.click.bind(el);
-                        el.click = function() {
-                            const href = el.href || '';
-                            if (href.startsWith('blob:')) {
-                                fetch(href).then(r => r.text()).then(t => tryCapture(t, 'createElement.blob')).catch(() => {});
-                            } else if (href.startsWith('data:')) {
-                                const ci = href.indexOf(',');
-                                if (ci > -1) try { tryCapture(decodeURIComponent(href.substring(ci+1)), 'createElement.data'); } catch(e) {}
-                            }
-                            return origClick();
-                        };
-                    }
-                    return el;
-                };
-
-                // 3. Intercept click on ANY existing anchor element
-                const origAnchorClick = HTMLAnchorElement.prototype.click;
-                HTMLAnchorElement.prototype.click = function() {
-                    const href = this.href || '';
-                    if (href.startsWith('blob:')) {
-                        fetch(href).then(r => r.text()).then(t => tryCapture(t, 'anchor.blob')).catch(() => {});
-                    } else if (href.startsWith('data:')) {
-                        const ci = href.indexOf(',');
-                        if (ci > -1) try { tryCapture(decodeURIComponent(href.substring(ci+1)), 'anchor.data'); } catch(e) {}
-                    }
-                    return origAnchorClick.call(this);
-                };
-
-                // 4. Intercept URL.createObjectURL
-                const origCreateObjectURL = URL.createObjectURL.bind(URL);
-                URL.createObjectURL = function(blob) {
-                    const url = origCreateObjectURL(blob);
-                    if (blob instanceof Blob) {
-                        blob.text().then(t => tryCapture(t, 'createObjectURL')).catch(() => {});
-                    }
-                    return url;
-                };
-
-                // 5. Intercept window.open (some sites use this for downloads)
-                const origOpen = window.open;
-                window.open = function(url) {
-                    if (typeof url === 'string' && url.startsWith('data:')) {
-                        const ci = url.indexOf(',');
-                        if (ci > -1) try { tryCapture(decodeURIComponent(url.substring(ci+1)), 'window.open'); } catch(e) {}
-                    }
-                    return origOpen.apply(window, arguments);
-                };
-
-                // 6. Listen for download clicks on ANY element (capture phase)
-                document.addEventListener('click', function(e) {
-                    const a = e.target.closest('a[download], a[href^="blob:"], a[href^="data:"]');
-                    if (a) {
-                        const href = a.href || '';
-                        window.__csvInterceptLog.push('click listener: ' + href.substring(0, 80));
-                        if (href.startsWith('blob:')) {
-                            fetch(href).then(r => r.text()).then(t => tryCapture(t, 'clickListener.blob')).catch(() => {});
-                        } else if (href.startsWith('data:')) {
-                            const ci = href.indexOf(',');
-                            if (ci > -1) try { tryCapture(decodeURIComponent(href.substring(ci+1)), 'clickListener.data'); } catch(e) {}
-                        }
-                    }
-                }, true);
-            }""")
+            page.on('response', lambda r: asyncio.create_task(_capture_response(r)))
 
             try:
                 # Step 1: Navigate to FPL Review
@@ -226,7 +149,14 @@ class FPLReviewClient:
                     self.logger.warning("Data not loaded yet, retrying data trigger...")
                     await self._trigger_data_load(page)
 
-                # Step 6: Download CSV
+                # Step 6: Try to build CSV from captured network responses
+                csv_path = self.download_dir / "projected_points.csv"
+                result = await self._build_csv_from_network(csv_path)
+                if result:
+                    return result
+
+                # Step 7: Fall back to download button + DOM scrape
+                self.logger.info("Network capture didn't find projection data, trying download button...")
                 csv_path = await self._download_csv(page, context)
                 return csv_path
 
@@ -1080,217 +1010,197 @@ class FPLReviewClient:
         await page.screenshot(path=str(self.download_dir / "player_list_debug.png"), full_page=True)
         return False
 
-    async def _download_csv(self, page: Page, context) -> Optional[Path]:
-        """Find and click the CSV download button."""
-        try:
-            self.logger.info("Waiting for page to fully load...")
-            await page.wait_for_load_state("domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(5000)  # Wait for dynamic content
+    async def _build_csv_from_network(self, csv_path: Path) -> Optional[Path]:
+        """Build projected_points.csv from captured network responses.
 
-            # Take screenshot to see current state
-            await page.screenshot(path=str(self.download_dir / "planner_page.png"), full_page=True)
+        Scans all captured HTTP responses for player projection data
+        (JSON arrays or CSV text) and converts to CSV format.
+        """
+        import json as _json
 
-            # Scroll down to find the download button
-            self.logger.info("Scrolling down to find download button...")
-            for _ in range(15):
-                await page.evaluate("window.scrollBy(0, 400)")
-                await page.wait_for_timeout(300)
+        if not self._captured_responses:
+            self.logger.info("No network responses captured")
+            return None
 
-            # Try to expand/load the player list if there's a button or tab for it
-            try:
-                # Look for tabs or buttons that might show full player data
-                player_list_selectors = [
-                    'text="Player List"',
-                    'text="All Players"',
-                    'button:has-text("Player")',
-                    'a:has-text("Player List")',
-                    '[class*="tab"]:has-text("Player")',
-                    'text="Show All"',
-                ]
-                for selector in player_list_selectors:
-                    try:
-                        btn = page.locator(selector).first
-                        if await btn.is_visible(timeout=2000):
-                            self.logger.info(f"Clicking to expand player data: {selector}")
-                            await btn.click()
-                            await page.wait_for_timeout(3000)
-                            break
-                    except:
+        self.logger.info(f"Analyzing {len(self._captured_responses)} captured network responses...")
+
+        best_csv = None
+        best_rows = 0
+
+        for resp in self._captured_responses:
+            url = resp['url']
+            body = resp['body']
+            ct = resp['content_type']
+
+            # ── Check 1: Is this already CSV text? ──
+            if 'csv' in ct or (body.count(',') > 50 and body.count('\n') > 10):
+                lines = body.strip().split('\n')
+                if len(lines) > 10:
+                    # Sanity check: looks like player data?
+                    sample = '\n'.join(lines[:3]).lower()
+                    if any(kw in sample for kw in ['name', 'pos', 'xmins', 'total', 'gkp', 'def', 'mid', 'fwd']):
+                        self.logger.info(f"  Found CSV in response: {url[:80]} ({len(lines)} lines)")
+                        if len(lines) > best_rows:
+                            best_csv = body
+                            best_rows = len(lines)
                         continue
-            except:
-                pass
 
-            # Scroll through page to trigger lazy loading
-            self.logger.info("Scrolling to trigger lazy loading...")
-            for _ in range(5):
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(1000)
+            # ── Check 2: Is this JSON with player projection arrays? ──
+            if 'json' in ct or body.lstrip().startswith('{') or body.lstrip().startswith('['):
+                try:
+                    data = _json.loads(body)
+                except (ValueError, _json.JSONDecodeError):
+                    continue
 
-            # Ensure Player List data is loaded (not just the team squad visual)
+                # Find arrays of player-like objects anywhere in the JSON
+                arrays = []
+                if isinstance(data, list):
+                    arrays.append(data)
+                elif isinstance(data, dict):
+                    for key, val in data.items():
+                        if isinstance(val, list) and len(val) > 5:
+                            arrays.append(val)
+                        elif isinstance(val, dict):
+                            for k2, v2 in val.items():
+                                if isinstance(v2, list) and len(v2) > 5:
+                                    arrays.append(v2)
+
+                for arr in arrays:
+                    if not arr or not isinstance(arr[0], dict):
+                        continue
+
+                    # Check if objects look like player data
+                    keys_lower = {k.lower() for k in arr[0].keys()}
+                    has_player_fields = any(f in keys_lower for f in
+                        ['name', 'player', 'web_name', 'player_name'])
+                    has_numeric_fields = sum(1 for k in keys_lower
+                        if any(x in k for x in ['gw', 'pts', 'xp', 'min', 'total', 'ev'])) >= 2
+
+                    if not (has_player_fields or has_numeric_fields):
+                        continue
+
+                    if len(arr) <= best_rows:
+                        continue
+
+                    self.logger.info(f"  Found player JSON: {url[:80]} ({len(arr)} players, keys={list(arr[0].keys())[:8]})")
+
+                    # Convert JSON array to CSV
+                    headers = list(arr[0].keys())
+                    rows = [','.join(str(h) for h in headers)]
+                    for obj in arr:
+                        row = []
+                        for h in headers:
+                            val = str(obj.get(h, ''))
+                            if ',' in val or '"' in val:
+                                val = '"' + val.replace('"', '""') + '"'
+                            row.append(val)
+                        rows.append(','.join(row))
+
+                    best_csv = '\n'.join(rows)
+                    best_rows = len(arr)
+
+            # ── Check 3: JavaScript with embedded data ──
+            if 'javascript' in ct and len(body) > 1000:
+                # Look for large JSON arrays embedded in JS
+                # Pattern: variable = [{...}, {...}, ...]
+                import re
+                for match in re.finditer(r'=\s*(\[[\s\S]{500,}?\])\s*[;\n]', body):
+                    try:
+                        arr = _json.loads(match.group(1))
+                        if isinstance(arr, list) and len(arr) > 10 and isinstance(arr[0], dict):
+                            keys_lower = {k.lower() for k in arr[0].keys()}
+                            if any(f in keys_lower for f in ['name', 'player', 'web_name']):
+                                self.logger.info(f"  Found embedded JSON in JS: {url[:80]} ({len(arr)} items)")
+                                if len(arr) > best_rows:
+                                    headers = list(arr[0].keys())
+                                    rows = [','.join(str(h) for h in headers)]
+                                    for obj in arr:
+                                        row = []
+                                        for h in headers:
+                                            val = str(obj.get(h, ''))
+                                            if ',' in val or '"' in val:
+                                                val = '"' + val.replace('"', '""') + '"'
+                                            row.append(val)
+                                        rows.append(','.join(row))
+                                    best_csv = '\n'.join(rows)
+                                    best_rows = len(arr)
+                    except (ValueError, _json.JSONDecodeError):
+                        continue
+
+        if best_csv and best_rows >= 10:
+            csv_path.write_text(best_csv, encoding='utf-8')
+            self.logger.info(f"Built CSV from network data: {csv_path} ({best_rows} rows, {len(best_csv):,} bytes)")
+            return csv_path
+
+        # Log what we DID capture for debugging
+        self.logger.warning(f"No player projection data found in {len(self._captured_responses)} responses:")
+        for resp in self._captured_responses:
+            preview = resp['body'][:120].replace('\n', ' ')
+            self.logger.info(f"  {resp['url'][:80]} | {resp['size']:,}B | {preview}")
+
+        return None
+
+    async def _download_csv(self, page: Page, context) -> Optional[Path]:
+        """Try download button, then fall back to DOM scrape."""
+        try:
+            csv_path = self.download_dir / "projected_points.csv"
+
+            # Ensure Player List data is loaded
             await self._load_player_list_data(page)
 
-            # Look specifically for "Download Data (CSV)" button - be very specific
+            # Take screenshot for debugging
+            await page.screenshot(path=str(self.download_dir / "planner_page.png"), full_page=True)
+
+            # Find download button
             self.logger.info("Looking for CSV download button...")
             download_btn = None
-
-            # First, try to find by exact text match using JavaScript
-            try:
-                download_link = await page.evaluate("""() => {
-                    const links = document.querySelectorAll('a');
-                    for (const link of links) {
-                        const text = link.textContent.trim();
-                        if (text === 'Download Data (CSV)' || text === 'Download CSV') {
-                            return true;
-                        }
-                    }
-                    return false;
-                }""")
-                if download_link:
-                    # Use text-is for exact match
-                    download_btn = page.locator('a:text-is("Download Data (CSV)")').first
-                    if not await download_btn.is_visible(timeout=2000):
-                        download_btn = page.locator('a:text-is("Download CSV")').first
-                    self.logger.info("Found download button via exact text match")
-            except:
-                pass
-
-            # Fallback to pattern matching, but filter out Upload buttons
-            if not download_btn:
-                download_selectors = [
-                    'a:has-text("Download Data")',
-                    'button:has-text("Download Data")',
-                    'a:has-text("Download CSV")',
-                    'button:has-text("Download CSV")',
-                    '[download*=".csv"]',
-                    'a[href*=".csv"]',
-                ]
-
-                for selector in download_selectors:
-                    try:
-                        elements = page.locator(selector)
-                        count = await elements.count()
-                        if count > 0:
-                            for i in range(count):
-                                btn = elements.nth(i)
-                                if await btn.is_visible(timeout=1000):
-                                    text = (await btn.text_content() or "").strip()
-                                    # Skip if it contains "Upload"
-                                    if "upload" in text.lower():
-                                        continue
-                                    self.logger.info(f"Found element with selector '{selector}': {text[:50]}")
-                                    download_btn = btn
-                                    break
-                        if download_btn:
+            for selector in [
+                'a:has-text("Download Data")',
+                'button:has-text("Download Data")',
+                'a:has-text("Download CSV")',
+                'button:has-text("Download CSV")',
+            ]:
+                try:
+                    btn = page.locator(selector).first
+                    if await btn.is_visible(timeout=2000):
+                        text = (await btn.text_content() or "").strip()
+                        if "upload" not in text.lower():
+                            self.logger.info(f"Found download button: {text}")
+                            download_btn = btn
                             break
-                    except:
-                        continue
+                except:
+                    continue
 
             if not download_btn:
-                # No download button - try DOM scrape as last resort
-                self.logger.warning("Could not find CSV download button, trying DOM scrape...")
-                await page.screenshot(path=str(self.download_dir / "no_download_btn.png"), full_page=True)
-                links = await page.locator("a").all_text_contents()
-                self.logger.info(f"Links on page: {links[:20]}")
+                self.logger.warning("No download button found, trying DOM scrape...")
                 return await self._scrape_table_to_csv(page)
 
-            # Scroll the button into view and wait
             await download_btn.scroll_into_view_if_needed()
             await page.wait_for_timeout(1000)
 
-            # Set up download handling
-            csv_path = self.download_dir / "projected_points.csv"
+            # Auto-accept any dialog (the NOTICE popup)
+            page.on("dialog", lambda d: asyncio.create_task(d.accept()))
 
-            # Track existing *.csv files before download (broad glob)
-            system_downloads = Path.home() / "Downloads"
-            existing_files = set(self.download_dir.glob("*.csv"))
-            existing_system_files = set(system_downloads.glob("*.csv")) if system_downloads.exists() else set()
-
-            # JS interceptor already injected via context.add_init_script() at startup
-            self.logger.info("JS download interceptor active (injected via add_init_script)")
-
-            # Handle dialog with a delay
-            async def handle_dialog(dialog):
-                self.logger.info(f"Dialog appeared: {dialog.message[:100] if dialog.message else 'No message'}...")
-                await page.wait_for_timeout(500)
-                await dialog.accept()
-                self.logger.info("Dialog accepted")
-
-            page.on("dialog", lambda d: asyncio.create_task(handle_dialog(d)))
-
-            # Use expect_download() context manager for reliable download handling
-            self.logger.info("Clicking download button and waiting for download...")
+            # Try expect_download
             try:
-                async with page.expect_download(timeout=5000) as download_info:
+                async with page.expect_download(timeout=8000) as download_info:
                     await download_btn.click()
-
                 download = await download_info.value
-                self.logger.info(f"Download started: {download.suggested_filename}")
-
                 await download.save_as(str(csv_path))
-                self.logger.info(f"CSV downloaded successfully to {csv_path}")
+                self.logger.info(f"Download successful: {csv_path}")
                 return csv_path
-
             except Exception as e:
-                self.logger.warning(f"expect_download failed: {e}, trying fallback methods...")
+                self.logger.warning(f"expect_download failed: {e}")
 
-                # Fallback tier 1: Check JS interceptor for captured CSV content
-                await page.wait_for_timeout(3000)
-                intercept_log = await page.evaluate("() => window.__csvInterceptLog || []")
-                self.logger.info(f"JS interceptor log: {intercept_log}")
-                captured_csv = await page.evaluate("() => window.__capturedCSV")
-                if captured_csv and len(captured_csv) > 50:
-                    self.logger.info(f"Captured CSV via JS interceptor ({len(captured_csv)} chars)")
-                    csv_path.write_text(captured_csv, encoding="utf-8")
-                    self.logger.info(f"Saved intercepted CSV to {csv_path}")
-                    return csv_path
+            # Check if clicking the button triggered any new network responses
+            await page.wait_for_timeout(3000)
+            result = await self._build_csv_from_network(csv_path)
+            if result:
+                return result
 
-                # Fallback tier 2: Click again and scan for ANY new .csv file
-                await download_btn.click()
-                self.logger.info("Clicked download button again, scanning for new CSV files...")
-
-                for i in range(10):  # Wait up to 10 seconds
-                    await page.wait_for_timeout(1000)
-
-                    # Check JS interceptor again
-                    captured_csv = await page.evaluate("() => window.__capturedCSV")
-                    if captured_csv and len(captured_csv) > 50:
-                        self.logger.info(f"Captured CSV via JS interceptor ({len(captured_csv)} chars)")
-                        csv_path.write_text(captured_csv, encoding="utf-8")
-                        return csv_path
-
-                    # Check data directory for any new CSV
-                    current_files = set(self.download_dir.glob("*.csv"))
-                    new_files = current_files - existing_files
-                    if new_files:
-                        new_file = list(new_files)[0]
-                        self.logger.info(f"Found downloaded file in data dir: {new_file}")
-                        if new_file != csv_path:
-                            import shutil
-                            shutil.move(str(new_file), str(csv_path))
-                            self.logger.info(f"Moved to {csv_path}")
-                        return csv_path
-
-                    # Check system Downloads folder for any new CSV
-                    if system_downloads.exists():
-                        current_system_files = set(system_downloads.glob("*.csv"))
-                        new_system_files = current_system_files - existing_system_files
-                        if new_system_files:
-                            new_file = list(new_system_files)[0]
-                            self.logger.info(f"Found downloaded file in Downloads: {new_file}")
-                            import shutil
-                            shutil.move(str(new_file), str(csv_path))
-                            self.logger.info(f"Moved to {csv_path}")
-                            return csv_path
-
-                # Fallback tier 3: Scrape the DOM table directly
-                self.logger.warning("All download methods failed, trying DOM table scrape...")
-                scraped = await self._scrape_table_to_csv(page)
-                if scraped:
-                    return scraped
-
-                self.logger.error("All download and scrape methods failed")
-                await page.screenshot(path=str(self.download_dir / "download_failed.png"), full_page=True)
-                return None
+            # Last resort: DOM scrape
+            self.logger.info("Trying DOM table scrape...")
+            return await self._scrape_table_to_csv(page)
 
         except Exception as e:
             self.logger.error(f"Error downloading CSV: {e}")
