@@ -91,13 +91,12 @@ class FPLReviewClient:
                 self.logger.info("Navigating to FPL Review...")
                 await page.goto(self.FPLREVIEW_URL, wait_until="domcontentloaded", timeout=30000)
 
-                # Step 2: Find and click Patreon login
+                # Step 2: Try Patreon login (not required for Free Planner)
                 logged_in = await self._login_via_patreon(page)
                 if not logged_in:
-                    self.logger.error("Failed to login via Patreon")
-                    return None
+                    self.logger.warning("Patreon login failed - continuing with Free Planner (no login required)")
 
-                # Step 3: Navigate to FPL Review homepage first
+                # Step 3: Navigate to FPL Review Free Planner
                 self.logger.info("Navigating to FPL Review...")
                 await page.goto(self.FPLREVIEW_URL, wait_until="domcontentloaded", timeout=60000)
                 await page.wait_for_timeout(2000)
@@ -108,11 +107,12 @@ class FPLReviewClient:
                 # Step 4: Navigate to the planner via menu
                 await self._navigate_to_planner(page)
 
-                # Step 5: Check if we need to reconnect Patreon (will be on planner page now)
-                reconnected = await self._handle_fplreview_reconnect(page)
-                if reconnected:
-                    # Navigate back to planner after reconnect
-                    await self._navigate_to_planner(page)
+                # Step 5: Check if we need to reconnect Patreon (only if logged in)
+                if logged_in:
+                    reconnected = await self._handle_fplreview_reconnect(page)
+                    if reconnected:
+                        # Navigate back to planner after reconnect
+                        await self._navigate_to_planner(page)
 
                 # Step 5.5: Verify data is loaded before attempting download
                 data_ready = await self._wait_for_table_data(page, timeout_s=10)
@@ -968,7 +968,7 @@ class FPLReviewClient:
             # Use expect_download() context manager for reliable download handling
             self.logger.info("Clicking download button and waiting for download...")
             try:
-                async with page.expect_download(timeout=15000) as download_info:
+                async with page.expect_download(timeout=5000) as download_info:
                     await download_btn.click()
 
                 download = await download_info.value
@@ -994,7 +994,7 @@ class FPLReviewClient:
                 await download_btn.click()
                 self.logger.info("Clicked download button again, scanning for new CSV files...")
 
-                for i in range(30):  # Wait up to 30 seconds
+                for i in range(10):  # Wait up to 10 seconds
                     await page.wait_for_timeout(1000)
 
                     # Check JS interceptor again
