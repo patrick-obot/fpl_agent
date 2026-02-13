@@ -34,6 +34,16 @@ class FPLReviewClient:
         self.logger = logger or logging.getLogger(__name__)
         self.team_id = str(team_id) if team_id else ""
 
+    def _is_fplreview_url(self, url: str) -> bool:
+        """Check if URL's domain is fplreview.com (not just mentioned in query params)."""
+        from urllib.parse import urlparse
+        return urlparse(url).netloc.lower() in ("fplreview.com", "www.fplreview.com")
+
+    def _is_patreon_url(self, url: str) -> bool:
+        """Check if URL's domain is patreon.com."""
+        from urllib.parse import urlparse
+        return "patreon.com" in urlparse(url).netloc.lower()
+
     async def download_projections_csv(self, headless: bool = True) -> Optional[Path]:
         """
         Login to FPL Review via Patreon and download the projections CSV.
@@ -185,16 +195,16 @@ class FPLReviewClient:
             current_url = page.url
             self.logger.info(f"Current URL after click: {current_url}")
 
-            if "patreon.com" in current_url:
+            if self._is_patreon_url(current_url):
                 # We're on Patreon login page
                 return await self._complete_patreon_login(page)
-            elif "fplreview.com" in current_url:
+            elif self._is_fplreview_url(current_url):
                 # We were already logged in and got redirected back
                 self.logger.info("Already authenticated via Patreon (redirected back to FPL Review)")
                 return True
             else:
                 # Maybe there's a popup or redirect
-                self.logger.info("Unexpected URL, checking page state...")
+                self.logger.info(f"Unexpected URL: {current_url[:100]}")
                 return False
 
         except Exception as e:
@@ -316,41 +326,79 @@ class FPLReviewClient:
                 return False
 
             # Step 4: Fill password
+            await password_input.click()
             await password_input.fill(self.password)
             self.logger.info("Filled password")
+            await page.wait_for_timeout(1500)
 
             # Dismiss any consent popups before clicking login
             await self._accept_cookies(page)
 
-            # Step 5: Click login/submit button
-            login_btn = page.locator('button:has-text("Log in"), button:has-text("Login"), button[type="submit"]').first
-            await login_btn.click(force=True)  # force=True bypasses intercepting elements
-            self.logger.info("Clicked login button")
+            # Step 5: Submit login form
+            login_url = page.url
+            self.logger.info("Submitting login form...")
 
-            # Step 6: Wait for redirect back to FPL Review
-            self.logger.info("Waiting for redirect back to FPL Review...")
-            await page.wait_for_timeout(8000)
+            # Press Enter in password field (most reliable form submission)
+            await password_input.press("Enter")
+            self.logger.info("Pressed Enter to submit")
 
-            # Check if login was successful
+            # Step 6: Wait for URL to change (OAuth page or fplreview redirect)
+            self.logger.info("Waiting for redirect...")
+            redirected = False
+            for _ in range(30):
+                await page.wait_for_timeout(1000)
+                if page.url != login_url:
+                    redirected = True
+                    break
+
+            if not redirected:
+                # Fallback: try clicking Continue/submit button
+                self.logger.warning("No redirect after Enter, trying button click...")
+                try:
+                    submit_btn = page.locator('button[type="submit"], button:has-text("Continue")').first
+                    await submit_btn.click(force=True)
+                    for _ in range(15):
+                        await page.wait_for_timeout(1000)
+                        if page.url != login_url:
+                            redirected = True
+                            break
+                except:
+                    pass
+
+            if not redirected:
+                self.logger.error("Login did not redirect - check credentials or CAPTCHA")
+                try:
+                    error_el = page.locator('[class*="error"], [role="alert"]').first
+                    if await error_el.is_visible(timeout=2000):
+                        error_msg = await error_el.text_content()
+                        self.logger.error(f"Login error: {error_msg}")
+                except:
+                    pass
+                await page.screenshot(path=str(self.download_dir / "patreon_login_error.png"))
+                return False
+
             current_url = page.url
-            self.logger.info(f"URL after login: {current_url}")
+            self.logger.info(f"URL after login: {current_url[:120]}")
 
-            if "fplreview.com" in current_url:
+            if self._is_fplreview_url(current_url):
                 self.logger.info("Successfully logged in and redirected to FPL Review")
                 return True
 
-            # Might need to authorize the app
-            if "patreon.com" in current_url:
+            # Might need to authorize the app (OAuth Allow page)
+            if self._is_patreon_url(current_url):
                 try:
                     auth_btn = page.locator('button:has-text("Allow"), button:has-text("Authorize")').first
                     if await auth_btn.is_visible(timeout=5000):
                         await auth_btn.click()
                         self.logger.info("Clicked authorize button")
-                        await page.wait_for_timeout(5000)
+                        for _ in range(15):
+                            await page.wait_for_timeout(1000)
+                            if self._is_fplreview_url(page.url):
+                                break
                 except:
                     pass
 
-            return "fplreview.com" in page.url
+            return self._is_fplreview_url(page.url)
 
         except Exception as e:
             self.logger.error(f"Error completing Patreon login: {e}")
@@ -422,14 +470,21 @@ class FPLReviewClient:
             self.logger.info("Checking if Patreon reconnect is needed...")
             await page.wait_for_timeout(2000)  # Wait for page to settle
 
-            # Check if there's a "LOG IN WITH PATREON" button (case insensitive)
+            # Only reconnect if the page explicitly asks for it
+            needs_reconnect = await page.evaluate("""() => {
+                const text = (document.body.innerText || '').toLowerCase();
+                return text.includes('reconnect') || text.includes('premium subscriber');
+            }""")
+            if not needs_reconnect:
+                self.logger.info("No reconnect needed on this page")
+                return False
+
+            # Check if there's a "LOG IN WITH PATREON" button
             reconnect_selectors = [
                 'a:has-text("LOG IN WITH PATREON")',
                 'a:has-text("Log in with Patreon")',
                 'a:has-text("log in with patreon")',
                 'button:has-text("LOG IN WITH PATREON")',
-                'a[href*="patreon"]:visible',
-                ':text("LOG IN WITH PATREON")',
             ]
 
             for selector in reconnect_selectors:
@@ -440,35 +495,41 @@ class FPLReviewClient:
                         await btn.click()
                         await page.wait_for_timeout(3000)
 
-                        # Handle Patreon OAuth authorization page
-                        if "patreon.com" in page.url:
-                            self.logger.info(f"On Patreon page: {page.url}")
+                        # Handle Patreon page (could be OAuth allow OR login page)
+                        if self._is_patreon_url(page.url):
+                            self.logger.info(f"On Patreon page: {page.url[:120]}")
                             await page.screenshot(path=str(self.download_dir / "patreon_step2.png"))
 
-                            # Look for and click Allow/Authorize button
-                            allow_selectors = [
-                                'button:has-text("Allow")',
-                                'button:has-text("Authorize")',
-                                'button[data-tag="allow-button"]',
-                                'button[type="submit"]',
-                            ]
-
-                            for allow_sel in allow_selectors:
-                                try:
-                                    allow_btn = page.locator(allow_sel).first
-                                    if await allow_btn.is_visible(timeout=3000):
-                                        self.logger.info(f"Found Allow button with: {allow_sel}")
-                                        await allow_btn.click()
-                                        self.logger.info("Clicked Allow button")
-                                        await page.wait_for_timeout(5000)
-                                        break
-                                except:
+                            if "/login" in page.url:
+                                # Need full login (previous login didn't persist)
+                                self.logger.info("On Patreon login page, completing full login...")
+                                login_ok = await self._complete_patreon_login(page)
+                                if not login_ok:
+                                    self.logger.warning("Patreon login during reconnect failed")
                                     continue
+                            else:
+                                # OAuth authorization page - click Allow
+                                allow_selectors = [
+                                    'button:has-text("Allow")',
+                                    'button:has-text("Authorize")',
+                                    'button[data-tag="allow-button"]',
+                                ]
+                                for allow_sel in allow_selectors:
+                                    try:
+                                        allow_btn = page.locator(allow_sel).first
+                                        if await allow_btn.is_visible(timeout=3000):
+                                            self.logger.info(f"Found Allow button with: {allow_sel}")
+                                            await allow_btn.click()
+                                            self.logger.info("Clicked Allow button")
+                                            await page.wait_for_timeout(5000)
+                                            break
+                                    except:
+                                        continue
 
                             # Wait for redirect back to fplreview
                             self.logger.info("Waiting for redirect back to FPL Review...")
-                            for _ in range(10):
-                                if "fplreview.com" in page.url:
+                            for _ in range(15):
+                                if self._is_fplreview_url(page.url):
                                     break
                                 await page.wait_for_timeout(1000)
 
@@ -832,6 +893,22 @@ class FPLReviewClient:
             # Inject JS interceptor to capture blob/data URL downloads
             await page.evaluate("""() => {
                 window.__capturedCSV = null;
+                // Intercept Blob constructor to capture CSV data at creation
+                const OrigBlob = window.Blob;
+                window.Blob = function(parts, options) {
+                    const blob = new OrigBlob(parts, options);
+                    const type = (options && options.type) || '';
+                    if (type.includes('csv') || type.includes('text/plain') || type.includes('octet')) {
+                        try {
+                            const content = parts.map(p => typeof p === 'string' ? p : '').join('');
+                            if (content.length > 50 && content.includes(',') && content.includes('\\n')) {
+                                window.__capturedCSV = content;
+                            }
+                        } catch(e) {}
+                    }
+                    return blob;
+                };
+                window.Blob.prototype = OrigBlob.prototype;
                 // Intercept createElement('a').click() blob downloads
                 const origCreateElement = document.createElement.bind(document);
                 document.createElement = function(tag) {
@@ -891,7 +968,7 @@ class FPLReviewClient:
             # Use expect_download() context manager for reliable download handling
             self.logger.info("Clicking download button and waiting for download...")
             try:
-                async with page.expect_download(timeout=30000) as download_info:
+                async with page.expect_download(timeout=15000) as download_info:
                     await download_btn.click()
 
                 download = await download_info.value
