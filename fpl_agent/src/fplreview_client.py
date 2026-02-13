@@ -85,6 +85,73 @@ class FPLReviewClient:
             )
             page = context.pages[0] if context.pages else await context.new_page()
 
+            # Inject CSV interceptor BEFORE any page loads via add_init_script.
+            # This runs in every new document context before the page's own JS,
+            # so our patched Blob/createElement/createObjectURL are the ones
+            # the page's closures capture.
+            await context.add_init_script("""() => {
+                window.__capturedCSV = null;
+
+                // Intercept Blob constructor
+                const OrigBlob = window.Blob;
+                window.Blob = function(parts, options) {
+                    const blob = new OrigBlob(parts, options);
+                    const type = (options && options.type) || '';
+                    if (type.includes('csv') || type.includes('text/plain') || type.includes('octet')) {
+                        try {
+                            const content = parts.map(p => typeof p === 'string' ? p : '').join('');
+                            if (content.length > 50 && content.includes(',') && content.includes('\\n')) {
+                                window.__capturedCSV = content;
+                            }
+                        } catch(e) {}
+                    }
+                    return blob;
+                };
+                window.Blob.prototype = OrigBlob.prototype;
+
+                // Intercept createElement('a').click() for blob/data URL downloads
+                const origCreateElement = document.createElement.bind(document);
+                document.createElement = function(tag) {
+                    const el = origCreateElement(tag);
+                    if (tag.toLowerCase() === 'a') {
+                        const origClick = el.click.bind(el);
+                        el.click = function() {
+                            const href = el.href || '';
+                            if (href.startsWith('blob:')) {
+                                fetch(href).then(r => r.text()).then(t => {
+                                    if (t.length > 50) window.__capturedCSV = t;
+                                }).catch(() => {});
+                            } else if (href.startsWith('data:')) {
+                                const commaIdx = href.indexOf(',');
+                                if (commaIdx > -1) {
+                                    try {
+                                        window.__capturedCSV = decodeURIComponent(href.substring(commaIdx + 1));
+                                    } catch(e) {
+                                        window.__capturedCSV = href.substring(commaIdx + 1);
+                                    }
+                                }
+                            }
+                            return origClick();
+                        };
+                    }
+                    return el;
+                };
+
+                // Intercept URL.createObjectURL
+                const origCreateObjectURL = URL.createObjectURL.bind(URL);
+                URL.createObjectURL = function(blob) {
+                    const url = origCreateObjectURL(blob);
+                    if (blob instanceof Blob) {
+                        blob.text().then(t => {
+                            if (t.length > 50 && t.includes(',') && (t.includes('\\n') || t.includes('Name'))) {
+                                window.__capturedCSV = t;
+                            }
+                        }).catch(() => {});
+                    }
+                    return url;
+                };
+            }""")
+
             try:
                 # Step 1: Navigate to FPL Review
                 self.logger.info("Navigating to FPL Review...")
@@ -1098,71 +1165,8 @@ class FPLReviewClient:
             existing_files = set(self.download_dir.glob("*.csv"))
             existing_system_files = set(system_downloads.glob("*.csv")) if system_downloads.exists() else set()
 
-            # Inject JS interceptor to capture blob/data URL downloads
-            await page.evaluate("""() => {
-                window.__capturedCSV = null;
-                // Intercept Blob constructor to capture CSV data at creation
-                const OrigBlob = window.Blob;
-                window.Blob = function(parts, options) {
-                    const blob = new OrigBlob(parts, options);
-                    const type = (options && options.type) || '';
-                    if (type.includes('csv') || type.includes('text/plain') || type.includes('octet')) {
-                        try {
-                            const content = parts.map(p => typeof p === 'string' ? p : '').join('');
-                            if (content.length > 50 && content.includes(',') && content.includes('\\n')) {
-                                window.__capturedCSV = content;
-                            }
-                        } catch(e) {}
-                    }
-                    return blob;
-                };
-                window.Blob.prototype = OrigBlob.prototype;
-                // Intercept createElement('a').click() blob downloads
-                const origCreateElement = document.createElement.bind(document);
-                document.createElement = function(tag) {
-                    const el = origCreateElement(tag);
-                    if (tag.toLowerCase() === 'a') {
-                        const origClick = el.click.bind(el);
-                        el.click = function() {
-                            const href = el.href || '';
-                            if (href.startsWith('blob:') || href.startsWith('data:')) {
-                                // Capture blob URL content
-                                if (href.startsWith('blob:')) {
-                                    fetch(href).then(r => r.text()).then(t => {
-                                        window.__capturedCSV = t;
-                                    }).catch(() => {});
-                                } else if (href.startsWith('data:')) {
-                                    // data:text/csv;charset=utf-8,...
-                                    const commaIdx = href.indexOf(',');
-                                    if (commaIdx > -1) {
-                                        try {
-                                            window.__capturedCSV = decodeURIComponent(href.substring(commaIdx + 1));
-                                        } catch(e) {
-                                            window.__capturedCSV = href.substring(commaIdx + 1);
-                                        }
-                                    }
-                                }
-                            }
-                            return origClick();
-                        };
-                    }
-                    return el;
-                };
-                // Also intercept window.URL.createObjectURL
-                const origCreateObjectURL = URL.createObjectURL.bind(URL);
-                URL.createObjectURL = function(blob) {
-                    const url = origCreateObjectURL(blob);
-                    if (blob instanceof Blob) {
-                        blob.text().then(t => {
-                            if (t.includes(',') && (t.includes('\\n') || t.includes('Pos') || t.includes('Name'))) {
-                                window.__capturedCSV = t;
-                            }
-                        }).catch(() => {});
-                    }
-                    return url;
-                };
-            }""")
-            self.logger.info("Injected JS download interceptor")
+            # JS interceptor already injected via context.add_init_script() at startup
+            self.logger.info("JS download interceptor active (injected via add_init_script)")
 
             # Handle dialog with a delay
             async def handle_dialog(dialog):
@@ -1257,7 +1261,10 @@ class FPLReviewClient:
             self.logger.info("Attempting to scrape table data from DOM...")
 
             table_data = await page.evaluate("""() => {
-                // Find the Player List table (has numeric projected points, no "Empty Slot")
+                // Find the Player List table by checking header rows for
+                // player-specific column names. The Fixture Schedule table has
+                // team abbreviations and DGW probabilities - we must skip it.
+                const PLAYER_HEADERS = ['name', 'pos', 'xmins', 'total', 'price'];
                 const tables = document.querySelectorAll('table');
                 let bestTable = null;
                 let bestScore = 0;
@@ -1266,30 +1273,47 @@ class FPLReviewClient:
                     const rows = table.querySelectorAll('tr');
                     if (rows.length < 3) continue;
 
-                    let hasEmptySlot = false;
-                    let numericCells = 0;
-                    let totalCells = 0;
-
-                    for (const row of rows) {
-                        const cells = row.querySelectorAll('td');
+                    // Check first two rows for player-specific header keywords
+                    let headerScore = 0;
+                    for (let r = 0; r < Math.min(2, rows.length); r++) {
+                        const cells = rows[r].querySelectorAll('th, td');
                         for (const cell of cells) {
-                            const text = cell.textContent.trim();
-                            if (text.includes('Empty Slot')) {
-                                hasEmptySlot = true;
-                                break;
+                            const text = cell.textContent.trim().toLowerCase();
+                            for (const kw of PLAYER_HEADERS) {
+                                if (text === kw || text.includes(kw)) {
+                                    headerScore += 10;
+                                }
                             }
-                            totalCells++;
-                            if (/^\\d+\\.\\d+$/.test(text)) numericCells++;
+                            // Also check for currency symbol (price column)
+                            if (text.includes('\\u00a3')) headerScore += 5;
                         }
-                        if (hasEmptySlot) break;
                     }
 
-                    // Skip tables with "Empty Slot" (team visual, not data)
+                    // Check body rows for player names and data quality
+                    let hasEmptySlot = false;
+                    let playerNameCount = 0;
+                    let dataRowCount = 0;
+                    const bodyRows = table.querySelectorAll('tbody tr');
+                    for (const row of bodyRows) {
+                        const text = row.textContent || '';
+                        if (text.includes('Empty Slot')) { hasEmptySlot = true; break; }
+                        if (/\\d+\\.\\d/.test(text)) dataRowCount++;
+                        // Look for player-name-like cells (>3 chars, mostly letters,
+                        // not a short team code like MCI/CRY)
+                        const cells = row.querySelectorAll('td');
+                        for (const cell of cells) {
+                            const ct = cell.textContent.trim();
+                            if (ct.length > 3 && /^[A-Za-z][A-Za-z .'-]+$/.test(ct)) {
+                                playerNameCount++;
+                                break;
+                            }
+                        }
+                    }
+
                     if (hasEmptySlot) continue;
 
-                    // Score by row count weighted by numeric density
-                    const density = totalCells > 0 ? numericCells / totalCells : 0;
-                    const score = rows.length * (1 + density * 10);
+                    // Score: header keywords strongest, then player names, then row count
+                    const score = headerScore + playerNameCount * 2 + dataRowCount;
                     if (score > bestScore) {
                         bestScore = score;
                         bestTable = table;
@@ -1304,9 +1328,7 @@ class FPLReviewClient:
                     const cells = row.querySelectorAll('th, td');
                     const rowData = [];
                     for (const cell of cells) {
-                        // Get text content, trim whitespace
                         let text = cell.textContent.trim();
-                        // Escape commas and quotes for CSV
                         if (text.includes(',') || text.includes('"') || text.includes('\\n')) {
                             text = '"' + text.replace(/"/g, '""') + '"';
                         }
