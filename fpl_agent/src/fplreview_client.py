@@ -841,6 +841,113 @@ class FPLReviewClient:
         self.logger.warning(f"No table data found after {timeout_s}s")
         return False
 
+    async def _load_player_list_data(self, page: Page) -> bool:
+        """Ensure the Player List table (projected points) has data loaded."""
+        self.logger.info("Checking if Player List data is loaded...")
+
+        # Check if any table already has real player data (numeric projected points)
+        row_count = await page.evaluate("""() => {
+            const tables = document.querySelectorAll('table');
+            for (const table of tables) {
+                const rows = table.querySelectorAll('tbody tr');
+                let dataRows = 0;
+                for (const row of rows) {
+                    const text = row.textContent || '';
+                    // Real data has decimal numbers (projected points like "5.6")
+                    // and does NOT have "Empty Slot"
+                    if (!text.includes('Empty Slot') && /\\d+\\.\\d/.test(text)) {
+                        dataRows++;
+                    }
+                }
+                if (dataRows >= 10) return dataRows;
+            }
+            return 0;
+        }""")
+
+        if row_count >= 10:
+            self.logger.info(f"Player List already has {row_count} data rows")
+            return True
+
+        # Player List not loaded - try triggering via Load Group dropdown
+        self.logger.info("Player List empty, triggering data load...")
+
+        # Scroll to the Projected Points Table section
+        await page.evaluate("""() => {
+            const headings = document.querySelectorAll('h1, h2, h3, h4, h5, strong');
+            for (const h of headings) {
+                if (h.textContent.includes('Projected Points') || h.textContent.includes('Player List')) {
+                    h.scrollIntoView({behavior: 'instant', block: 'center'});
+                    return;
+                }
+            }
+            // Fallback: scroll to bottom half of page
+            window.scrollTo(0, document.body.scrollHeight * 0.6);
+        }""")
+        await page.wait_for_timeout(2000)
+
+        # Try selecting Load Group dropdown to trigger data refresh
+        load_group_selectors = [
+            'select:near(:text("Load Group"))',
+            'select[id*="group" i]',
+            'select[name*="group" i]',
+        ]
+        for selector in load_group_selectors:
+            try:
+                dropdown = page.locator(selector).first
+                if await dropdown.is_visible(timeout=3000):
+                    options = await dropdown.locator("option").all_text_contents()
+                    self.logger.info(f"Load Group options: {options[:5]}")
+                    # Select "Top 50" or first option
+                    for i, opt in enumerate(options):
+                        if "50" in opt or "top" in opt.lower() or "all" in opt.lower():
+                            await dropdown.select_option(index=i)
+                            self.logger.info(f"Selected Load Group: {opt}")
+                            break
+                    else:
+                        await dropdown.select_option(index=0)
+                        self.logger.info(f"Selected first Load Group option")
+                    await page.wait_for_timeout(5000)
+                    break
+            except:
+                continue
+
+        # Try clicking EV display button
+        try:
+            ev_btn = page.locator('button:has-text("EV"), a:has-text("EV")').first
+            if await ev_btn.is_visible(timeout=2000):
+                await ev_btn.click()
+                self.logger.info("Clicked EV display button")
+                await page.wait_for_timeout(3000)
+        except:
+            pass
+
+        # Wait for Player List data to appear (up to 30s)
+        for attempt in range(15):
+            row_count = await page.evaluate("""() => {
+                const tables = document.querySelectorAll('table');
+                for (const table of tables) {
+                    const rows = table.querySelectorAll('tbody tr');
+                    let dataRows = 0;
+                    for (const row of rows) {
+                        const text = row.textContent || '';
+                        if (!text.includes('Empty Slot') && /\\d+\\.\\d/.test(text)) {
+                            dataRows++;
+                        }
+                    }
+                    if (dataRows >= 10) return dataRows;
+                }
+                return 0;
+            }""")
+            if row_count >= 10:
+                self.logger.info(f"Player List loaded: {row_count} data rows")
+                return True
+            await page.wait_for_timeout(2000)
+
+        self.logger.warning(f"Player List has only {row_count} data rows after waiting")
+        # Take screenshot for debugging
+        await page.screenshot(path=str(self.download_dir / "player_list_debug.png"), full_page=True)
+        return False
+
     async def _download_csv(self, page: Page, context) -> Optional[Path]:
         """Find and click the CSV download button."""
         try:
@@ -886,6 +993,9 @@ class FPLReviewClient:
             for _ in range(5):
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(1000)
+
+            # Ensure Player List data is loaded (not just the team squad visual)
+            await self._load_player_list_data(page)
 
             # Look specifically for "Download Data (CSV)" button - be very specific
             self.logger.info("Looking for CSV download button...")
@@ -1122,20 +1232,46 @@ class FPLReviewClient:
             self.logger.info("Attempting to scrape table data from DOM...")
 
             table_data = await page.evaluate("""() => {
-                // Find the largest table on the page (most likely the player data table)
+                // Find the Player List table (has numeric projected points, no "Empty Slot")
                 const tables = document.querySelectorAll('table');
                 let bestTable = null;
-                let bestRowCount = 0;
+                let bestScore = 0;
 
                 for (const table of tables) {
                     const rows = table.querySelectorAll('tr');
-                    if (rows.length > bestRowCount) {
-                        bestRowCount = rows.length;
+                    if (rows.length < 3) continue;
+
+                    let hasEmptySlot = false;
+                    let numericCells = 0;
+                    let totalCells = 0;
+
+                    for (const row of rows) {
+                        const cells = row.querySelectorAll('td');
+                        for (const cell of cells) {
+                            const text = cell.textContent.trim();
+                            if (text.includes('Empty Slot')) {
+                                hasEmptySlot = true;
+                                break;
+                            }
+                            totalCells++;
+                            if (/^\\d+\\.\\d+$/.test(text)) numericCells++;
+                        }
+                        if (hasEmptySlot) break;
+                    }
+
+                    // Skip tables with "Empty Slot" (team visual, not data)
+                    if (hasEmptySlot) continue;
+
+                    // Score by row count weighted by numeric density
+                    const density = totalCells > 0 ? numericCells / totalCells : 0;
+                    const score = rows.length * (1 + density * 10);
+                    if (score > bestScore) {
+                        bestScore = score;
                         bestTable = table;
                     }
                 }
 
-                if (!bestTable || bestRowCount < 3) return null;
+                if (!bestTable || bestScore < 3) return null;
 
                 const result = [];
                 const rows = bestTable.querySelectorAll('tr');
