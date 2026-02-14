@@ -7,6 +7,7 @@ projected points CSV from fplreview.com.
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -27,12 +28,18 @@ class FPLReviewClient:
         download_dir: Path,
         logger: Optional[logging.Logger] = None,
         team_id: str = "",
+        verbose: Optional[bool] = None,
     ):
         self.email = email
         self.password = password
         self.download_dir = download_dir
         self.logger = logger or logging.getLogger(__name__)
         self.team_id = str(team_id) if team_id else ""
+        if verbose is None:
+            verbose_env = (os.getenv("FPL_REVIEW_VERBOSE") or "false").strip().lower()
+            self.verbose = verbose_env in {"1", "true", "yes", "on"}
+        else:
+            self.verbose = verbose
 
     def _is_fplreview_url(self, url: str) -> bool:
         """Check if URL's domain is fplreview.com (not just mentioned in query params)."""
@@ -109,7 +116,8 @@ class FPLReviewClient:
                         'body': body,
                         'size': len(body),
                     })
-                    self.logger.info(f"  [NET] Captured: {url[:100]} ({len(body):,} bytes, {ct[:30]})")
+                    if self.verbose:
+                        self.logger.info(f"  [NET] Captured: {url[:100]} ({len(body):,} bytes, {ct[:30]})")
                 except Exception:
                     pass
 
@@ -1133,10 +1141,12 @@ class FPLReviewClient:
             return csv_path
 
         # Log what we DID capture for debugging
-        self.logger.warning(f"No player projection data found in {len(self._captured_responses)} responses:")
-        for resp in self._captured_responses:
-            preview = resp['body'][:120].replace('\n', ' ')
-            self.logger.info(f"  {resp['url'][:80]} | {resp['size']:,}B | {preview}")
+        self.logger.warning(f"No player projection data found in {len(self._captured_responses)} responses.")
+        if self.verbose:
+            self.logger.info("Verbose mode enabled: dumping captured response previews for debugging.")
+            for resp in self._captured_responses:
+                preview = resp['body'][:120].replace('\n', ' ')
+                self.logger.info(f"  {resp['url'][:80]} | {resp['size']:,}B | {preview}")
 
         return None
 
@@ -1227,8 +1237,9 @@ class FPLReviewClient:
                 });
                 return info;
             }""")
-            for line in debug_info:
-                self.logger.info(f"  {line}")
+            if self.verbose:
+                for line in debug_info:
+                    self.logger.info(f"  {line}")
 
             # Strategy: find the table nearest to the "Player List" heading in the DOM
             table_data = await page.evaluate("""() => {
@@ -1351,6 +1362,7 @@ async def download_fplreview_projections(
     headless: bool = True,
     logger: Optional[logging.Logger] = None,
     team_id: str = "",
+    verbose: Optional[bool] = None,
 ) -> Optional[Path]:
     """
     Convenience function to download FPL Review projections.
@@ -1362,11 +1374,19 @@ async def download_fplreview_projections(
         headless: Run browser in headless mode
         logger: Optional logger instance
         team_id: FPL team ID to load data for
+        verbose: Enable extra network/HTML debug logging
 
     Returns:
         Path to downloaded CSV, or None if failed
     """
-    client = FPLReviewClient(email, password, download_dir, logger, team_id=team_id)
+    client = FPLReviewClient(
+        email,
+        password,
+        download_dir,
+        logger,
+        team_id=team_id,
+        verbose=verbose,
+    )
     return await client.download_projections_csv(headless=headless)
 
 
