@@ -96,13 +96,22 @@ class FPLReviewClient:
             # Capture ALL HTTP responses from fplreview.com that might
             # contain player projection data (JSON/CSV/text).
             self._captured_responses = []
+            self._captured_csv_urls = []
 
             async def _capture_response(response):
                 try:
                     url = response.url
                     if 'fplreview' not in url:
                         return
+                    cd = response.headers.get('content-disposition', '').lower()
                     ct = response.headers.get('content-type', '')
+                    ct_lower = ct.lower()
+                    if response.status == 200 and (
+                        'csv' in ct_lower or 'attachment' in cd or '.csv' in url.lower()
+                    ):
+                        if url not in self._captured_csv_urls:
+                            self._captured_csv_urls.append(url)
+                            self.logger.info(f"Detected CSV URL candidate: {url}")
                     if not any(t in ct for t in ['json', 'text', 'csv', 'javascript']):
                         return
                     if response.status != 200:
@@ -1152,6 +1161,35 @@ class FPLReviewClient:
 
         return None
 
+    async def _download_csv_from_captured_url(self, context, csv_path: Path) -> Optional[Path]:
+        """Fetch CSV directly from captured response URLs using authenticated cookies."""
+        if not getattr(self, "_captured_csv_urls", None):
+            return None
+
+        # Use the most recent candidates first.
+        for url in reversed(self._captured_csv_urls):
+            try:
+                response = await context.request.get(url, timeout=30000)
+                if not response.ok:
+                    continue
+
+                body = await response.body()
+                if len(body) < 100:
+                    continue
+
+                # Basic guard to avoid saving random binaries.
+                sample = body[:2048].decode("utf-8", errors="ignore")
+                if "," not in sample and "\n" not in sample:
+                    continue
+
+                csv_path.write_bytes(body)
+                self.logger.info(f"CSV saved from captured URL: {url}")
+                return csv_path
+            except Exception:
+                continue
+
+        return None
+
     async def _download_csv(self, page: Page, context) -> Optional[Path]:
         """Try download button, then fall back to DOM scrape."""
         try:
@@ -1203,6 +1241,12 @@ class FPLReviewClient:
                 return csv_path
             except Exception as e:
                 self.logger.warning(f"expect_download failed: {e}")
+
+            # Try direct fetch from captured CSV URL (auth cookies are reused by context.request).
+            await page.wait_for_timeout(1500)
+            direct_csv = await self._download_csv_from_captured_url(context, csv_path)
+            if direct_csv:
+                return direct_csv
 
             # Check if clicking the button triggered any new network responses
             await page.wait_for_timeout(3000)
