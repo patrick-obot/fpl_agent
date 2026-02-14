@@ -94,8 +94,6 @@ class FPLReviewClient:
             async def _capture_response(response):
                 try:
                     url = response.url
-                    if 'fplreview' not in url:
-                        return
                     ct = response.headers.get('content-type', '')
                     ct_lower = ct.lower()
                     cd = response.headers.get('content-disposition', '').lower()
@@ -105,6 +103,10 @@ class FPLReviewClient:
                         if url not in self._captured_csv_urls:
                             self._captured_csv_urls.append(url)
                             self.logger.info(f"Detected CSV URL candidate: {url}")
+
+                    # Keep heavy response-body capture limited to fplreview domain.
+                    if 'fplreview' not in url:
+                        return
                     if not any(t in ct for t in ['json', 'text', 'csv', 'javascript']):
                         return
                     if response.status != 200:
@@ -1147,6 +1149,19 @@ class FPLReviewClient:
 
         return None
 
+    def _is_valid_projection_csv(self, csv_text: str) -> bool:
+        """Basic sanity checks to avoid saving non-projection tables."""
+        lines = [ln for ln in csv_text.splitlines() if ln.strip()]
+        if len(lines) < 20:
+            return False
+
+        header = lines[0].lower()
+        sample = "\n".join(lines[:25]).lower()
+
+        has_player_signal = any(k in sample for k in ["gkp", "def", "mid", "fwd", "xmins", "player", "name"])
+        has_projection_shape = "gw" in header or "gw" in sample
+        return has_player_signal and has_projection_shape
+
     async def _download_csv_from_captured_url(self, context, csv_path: Path) -> Optional[Path]:
         """Fetch CSV directly from captured URLs using authenticated session cookies."""
         if not self._captured_csv_urls:
@@ -1162,8 +1177,11 @@ class FPLReviewClient:
                 if len(body) < 100:
                     continue
 
-                sample = body[:2048].decode("utf-8", errors="ignore").lower()
+                text = body.decode("utf-8", errors="ignore")
+                sample = text[:2048].lower()
                 if "," not in sample or "\n" not in sample:
+                    continue
+                if not self._is_valid_projection_csv(text):
                     continue
 
                 csv_path.write_bytes(body)
@@ -1372,6 +1390,9 @@ class FPLReviewClient:
 
             if not table_data:
                 self.logger.warning("No table data found in DOM to scrape")
+                return None
+            if not self._is_valid_projection_csv(table_data):
+                self.logger.warning("DOM scrape result did not match projection CSV shape; ignoring fallback output.")
                 return None
 
             csv_path = self.download_dir / "projected_points.csv"
