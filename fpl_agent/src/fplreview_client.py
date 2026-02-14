@@ -109,7 +109,7 @@ class FPLReviewClient:
                         'body': body,
                         'size': len(body),
                     })
-                    self.logger.info(f"  [NET] Captured: {url[:100]} ({len(body):,} bytes, {ct[:30]})")
+                    self.logger.debug(f"  [NET] Captured: {url[:100]} ({len(body):,} bytes, {ct[:30]})")
                 except Exception:
                     pass
 
