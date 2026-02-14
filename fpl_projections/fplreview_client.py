@@ -116,8 +116,10 @@ class FPLReviewClient:
                         'body': body,
                         'size': len(body),
                     })
-                    if self.verbose:
-                        self.logger.info(f"  [NET] Captured: {url[:100]} ({len(body):,} bytes, {ct[:30]})")
+                    if self.verbose and self.logger.isEnabledFor(logging.DEBUG):
+                        self.logger.debug(
+                            f"  [NET] Captured: {url[:100]} ({len(body):,} bytes, {ct[:30]})"
+                        )
                 except Exception:
                     pass
 
