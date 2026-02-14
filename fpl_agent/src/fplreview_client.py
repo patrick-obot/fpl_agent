@@ -89,6 +89,7 @@ class FPLReviewClient:
             # Capture ALL HTTP responses from fplreview.com that might
             # contain player projection data (JSON/CSV/text).
             self._captured_responses = []
+            self._captured_csv_urls = []
 
             async def _capture_response(response):
                 try:
@@ -96,6 +97,14 @@ class FPLReviewClient:
                     if 'fplreview' not in url:
                         return
                     ct = response.headers.get('content-type', '')
+                    ct_lower = ct.lower()
+                    cd = response.headers.get('content-disposition', '').lower()
+                    if response.status == 200 and (
+                        'csv' in ct_lower or 'attachment' in cd or '.csv' in url.lower()
+                    ):
+                        if url not in self._captured_csv_urls:
+                            self._captured_csv_urls.append(url)
+                            self.logger.info(f"Detected CSV URL candidate: {url}")
                     if not any(t in ct for t in ['json', 'text', 'csv', 'javascript']):
                         return
                     if response.status != 200:
@@ -1033,13 +1042,14 @@ class FPLReviewClient:
             ct = resp['content_type']
 
             # ── Check 1: Is this already CSV text? ──
-            if 'csv' in ct or (body.count(',') > 50 and body.count('\n') > 10):
+            # Avoid false positives from CSS/JS by requiring CSV content-type or URL signal.
+            if ('csv' in ct.lower() or '.csv' in url.lower() or 'download' in url.lower()):
                 lines = body.strip().split('\n')
                 if len(lines) > 10:
                     # Sanity check: looks like player data?
                     sample = '\n'.join(lines[:3]).lower()
-                    if any(kw in sample for kw in ['name', 'pos', 'xmins', 'total', 'gkp', 'def', 'mid', 'fwd']):
-                        self.logger.info(f"  Found CSV in response: {url[:80]} ({len(lines)} lines)")
+                    if any(kw in sample for kw in ['name', 'pos', 'xmins', 'total', 'gkp', 'def', 'mid', 'fwd', 'team']):
+                        self.logger.debug(f"  Found CSV in response: {url[:80]} ({len(lines)} lines)")
                         if len(lines) > best_rows:
                             best_csv = body
                             best_rows = len(lines)
@@ -1082,7 +1092,7 @@ class FPLReviewClient:
                     if len(arr) <= best_rows:
                         continue
 
-                    self.logger.info(f"  Found player JSON: {url[:80]} ({len(arr)} players, keys={list(arr[0].keys())[:8]})")
+                    self.logger.debug(f"  Found player JSON: {url[:80]} ({len(arr)} players, keys={list(arr[0].keys())[:8]})")
 
                     # Convert JSON array to CSV
                     headers = list(arr[0].keys())
@@ -1110,7 +1120,7 @@ class FPLReviewClient:
                         if isinstance(arr, list) and len(arr) > 10 and isinstance(arr[0], dict):
                             keys_lower = {k.lower() for k in arr[0].keys()}
                             if any(f in keys_lower for f in ['name', 'player', 'web_name']):
-                                self.logger.info(f"  Found embedded JSON in JS: {url[:80]} ({len(arr)} items)")
+                                self.logger.debug(f"  Found embedded JSON in JS: {url[:80]} ({len(arr)} items)")
                                 if len(arr) > best_rows:
                                     headers = list(arr[0].keys())
                                     rows = [','.join(str(h) for h in headers)]
@@ -1133,10 +1143,34 @@ class FPLReviewClient:
             return csv_path
 
         # Log what we DID capture for debugging
-        self.logger.warning(f"No player projection data found in {len(self._captured_responses)} responses:")
-        for resp in self._captured_responses:
-            preview = resp['body'][:120].replace('\n', ' ')
-            self.logger.info(f"  {resp['url'][:80]} | {resp['size']:,}B | {preview}")
+        self.logger.warning(f"No player projection data found in {len(self._captured_responses)} responses.")
+
+        return None
+
+    async def _download_csv_from_captured_url(self, context, csv_path: Path) -> Optional[Path]:
+        """Fetch CSV directly from captured URLs using authenticated session cookies."""
+        if not self._captured_csv_urls:
+            return None
+
+        for url in reversed(self._captured_csv_urls):
+            try:
+                resp = await context.request.get(url, timeout=30000)
+                if not resp.ok:
+                    continue
+
+                body = await resp.body()
+                if len(body) < 100:
+                    continue
+
+                sample = body[:2048].decode("utf-8", errors="ignore").lower()
+                if "," not in sample or "\n" not in sample:
+                    continue
+
+                csv_path.write_bytes(body)
+                self.logger.info(f"CSV saved from captured URL: {url}")
+                return csv_path
+            except Exception:
+                continue
 
         return None
 
@@ -1191,6 +1225,12 @@ class FPLReviewClient:
                 return csv_path
             except Exception as e:
                 self.logger.warning(f"expect_download failed: {e}")
+
+            # Try direct fetch from captured CSV URL with current authenticated context.
+            await page.wait_for_timeout(1500)
+            direct_csv = await self._download_csv_from_captured_url(context, csv_path)
+            if direct_csv:
+                return direct_csv
 
             # Check if clicking the button triggered any new network responses
             await page.wait_for_timeout(3000)
