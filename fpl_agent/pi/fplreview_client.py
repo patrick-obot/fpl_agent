@@ -243,12 +243,15 @@ class FPLReviewClient:
             self.logger.info(f"Current URL after click: {current_url}")
 
             if self._is_patreon_url(current_url):
-                if "/oauth2/" in current_url or "authorize" in current_url:
+                from urllib.parse import urlparse
+                path = urlparse(current_url).path
+                if "/oauth2/" in path or "/authorize" in path:
                     # OAuth authorization page (already logged in, session saved)
                     self.logger.info("On OAuth authorization page, clicking Allow...")
                     return await self._handle_oauth_allow(page)
                 else:
                     # Login page - need email + password
+                    self.logger.info(f"On Patreon login page (path={path})")
                     return await self._complete_patreon_login(page)
             elif self._is_fplreview_url(current_url):
                 # We were already logged in and got redirected back
@@ -1150,17 +1153,34 @@ class FPLReviewClient:
         return None
 
     def _is_valid_projection_csv(self, csv_text: str) -> bool:
-        """Basic sanity checks to avoid saving non-projection tables."""
+        """Validate that CSV has proper projection format with individual columns.
+
+        The proper FPL Review CSV has columns like:
+            ID, Name, Team, Pos, 27_xMins, 27_Pts, 28_xMins, 28_Pts, ...
+        The display table (wrong) has:
+            ,,xMins,GW27,GW28,...  with names like "M.SalahMD 14.0"
+        """
         lines = [ln for ln in csv_text.splitlines() if ln.strip()]
         if len(lines) < 20:
             return False
 
         header = lines[0].lower()
-        sample = "\n".join(lines[:25]).lower()
 
-        has_player_signal = any(k in sample for k in ["gkp", "def", "mid", "fwd", "xmins", "player", "name"])
-        has_projection_shape = "gw" in header or "gw" in sample
-        return has_player_signal and has_projection_shape
+        # Must have separate Name/ID column in header
+        has_name_col = any(k in header for k in ["name", "id", "player"])
+        # Must have per-GW points columns (e.g. "27_pts" or "_pts")
+        has_pts_cols = "_pts" in header or "pts" in header
+        # Must have xMins per GW (e.g. "27_xmins")
+        has_xmins_cols = "_xmins" in header or "xmins" in header
+
+        # Reject summary table: header starts with empty columns and has "total"
+        looks_like_summary = header.startswith(",,") or "elite%" in header or "/£" in header
+
+        if looks_like_summary:
+            self.logger.debug("Rejected: looks like summary/display table")
+            return False
+
+        return has_name_col and (has_pts_cols or has_xmins_cols)
 
     async def _download_csv_from_captured_url(self, context, csv_path: Path) -> Optional[Path]:
         """Fetch CSV directly from captured URLs using authenticated session cookies."""
@@ -1233,6 +1253,32 @@ class FPLReviewClient:
             # Auto-accept any dialog (the NOTICE popup)
             page.on("dialog", lambda d: asyncio.create_task(d.accept()))
 
+            # Inject blob interception BEFORE clicking download button.
+            # The "Download Data (CSV)" button generates a JS blob download
+            # which Playwright's expect_download may not catch.
+            await page.evaluate("""() => {
+                window.__capturedCSV = null;
+                const origCreateObjectURL = URL.createObjectURL;
+                URL.createObjectURL = function(blob) {
+                    if (blob && blob.type && blob.type.includes('csv')) {
+                        blob.text().then(t => { window.__capturedCSV = t; });
+                    }
+                    // Also intercept anchor click downloads
+                    return origCreateObjectURL.call(URL, blob);
+                };
+                // Also hook Blob constructor for text/csv
+                const OrigBlob = window.Blob;
+                window.Blob = function(parts, options) {
+                    const b = new OrigBlob(parts, options);
+                    if (options && options.type && options.type.includes('csv')) {
+                        try { window.__capturedCSV = parts.join(''); } catch(e) {}
+                    }
+                    return b;
+                };
+                window.Blob.prototype = OrigBlob.prototype;
+            }""")
+            self.logger.info("Injected blob interception hooks")
+
             # Try expect_download
             try:
                 async with page.expect_download(timeout=8000) as download_info:
@@ -1243,6 +1289,18 @@ class FPLReviewClient:
                 return csv_path
             except Exception as e:
                 self.logger.warning(f"expect_download failed: {e}")
+
+            # Check if blob hook captured the CSV
+            await page.wait_for_timeout(2000)
+            captured = await page.evaluate("() => window.__capturedCSV")
+            if captured and len(captured) > 200:
+                self.logger.info(f"Captured CSV via blob hook ({len(captured):,} chars)")
+                if self._is_valid_projection_csv(captured):
+                    csv_path.write_text(captured, encoding='utf-8')
+                    self.logger.info(f"Saved blob-captured CSV to {csv_path}")
+                    return csv_path
+                else:
+                    self.logger.warning("Blob-captured data didn't pass projection CSV validation")
 
             # Try direct fetch from captured CSV URL with current authenticated context.
             await page.wait_for_timeout(1500)
