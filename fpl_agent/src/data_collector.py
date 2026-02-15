@@ -616,6 +616,16 @@ class DataCollector:
             self.logger.warning(f"Projected points file not found in {self.config.data_dir}")
             return self._projected_points
 
+        # Check CSV freshness (file is SCP'd from Raspberry Pi)
+        file_age_hours = (time.time() - csv_path.stat().st_mtime) / 3600
+        if file_age_hours > 24:
+            self.logger.warning(
+                f"projected_points.csv is {file_age_hours:.0f}h old — "
+                "check if Raspberry Pi download cron is working"
+            )
+        elif file_age_hours > 12:
+            self.logger.info(f"projected_points.csv is {file_age_hours:.0f}h old")
+
         try:
             df = pd.read_csv(csv_path, encoding='utf-8-sig')  # Handle BOM
             self.logger.info(f"Loading projected points from {csv_path}")

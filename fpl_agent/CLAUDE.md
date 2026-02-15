@@ -8,16 +8,21 @@ Autonomous Fantasy Premier League agent. Collects player data, optimizes transfe
 
 ```
 main.py          CLI entry point + scheduler daemon + orchestration
-update_projections.py  Download projections from FPL Review + deploy
+update_projections.py  Commit/push projected_points.csv (SCP'd from Pi)
 src/
   config.py      Config from .env (credentials, thresholds, paths)
   fpl_client.py  Async FPL API client (rate-limited, cached, retry logic)
-  fplreview_client.py  Automated FPL Review CSV download via Patreon OAuth
+  fplreview_client.py  STUB — download migrated to Raspberry Pi
   data_collector.py  Fixture difficulty, player news, projected points
   twitter_collector.py  Twitter/X API client for @robtFPL data (future)
   image_ocr.py   OCR extraction from tweet images (team odds)
   optimizer.py   Transfer + captain recommendations (constraint solver)
   executor.py    Safe execution: dry-run, audit trail, state snapshots, rollback
+pi/
+  download_and_upload.py  Download CSV from FPL Review + SCP to VPS
+  fplreview_client.py     Full Playwright browser automation (Patreon OAuth)
+  setup.sh                One-time Pi setup (venv, Playwright, SSH key)
+  .env.example            Pi-side config template
 ```
 
 ## Key Commands
@@ -29,10 +34,9 @@ python main.py schedule               # Scheduler daemon
 python main.py price-check            # Price monitoring only
 python main.py approve <plan_id>      # Approve pending plan (not used in autonomous mode)
 
-# Projection updates
-python update_projections.py              # Download from FPL Review + git commit/push
-python update_projections.py --skip-download  # Use existing CSV, just commit/push
-python update_projections.py --skip-commit    # Download only, no git operations
+# Projection updates (CSV is SCP'd from Raspberry Pi)
+python update_projections.py              # Commit + push projected_points.csv
+python update_projections.py --skip-commit  # Just show file info + freshness
 ```
 
 ## Scheduler
@@ -82,14 +86,12 @@ This ensures auto-subs bring on the best available player if a starter doesn't p
 
 ## Data Files
 
-- `data/projected_points.csv` - FPL Review projections (auto-downloaded via Patreon)
+- `data/projected_points.csv` - FPL Review projections (SCP'd from Raspberry Pi)
 - `data/data_cache.pkl` - 5-min API response cache
 - `data/audit_trail.json` - Decision audit log
 - `data/plans/*.json` - Execution plan history
 - `data/states/*.json` - Team state snapshots
 - `data/price_changes_*.csv` - Daily price reports
-- `data/browser_profile/` - Playwright browser state for FPL Review login
-- `data/*.png` - Debug screenshots from FPL Review download attempts
 
 ## Deployment (VPS with Docker)
 
@@ -131,8 +133,9 @@ See `.env.example` for full list. Required:
 - `DRY_RUN=false` - Enable live execution
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` - Telegram notifications (recommended)
 - `SMTP_*`, `NOTIFICATION_EMAIL` - Email notifications (optional fallback)
-- `FPL_REVIEW_EMAIL`, `FPL_REVIEW_PASSWORD` - Patreon credentials for FPL Review access
 - `X_BEARER_TOKEN` - Twitter API Bearer Token (future: team odds data)
+
+Note: FPL Review credentials are on the Raspberry Pi only (see `pi/.env.example`).
 
 ## Railway Backup
 
@@ -164,12 +167,12 @@ Railway config files are kept as backup in case of fallback:
 ## Current Status (Feb 13, 2026)
 
 - **Mode**: Fully autonomous (`confirm=True`, no human approval needed)
-- **Projections**: Auto-downloaded from FPL Review via Patreon OAuth
+- **Projections**: Downloaded by Raspberry Pi, SCP'd to VPS
 - **Notifications**: Telegram (primary) + Email (fallback), sent AFTER execution
 - **Approval workflow**: Disabled - scheduler uses `confirm=True` at `main.py:522`
 - **All critical bugs fixed**: Stale price cache, captain not set, approval blocking
 - **Chip strategy**: Proactive WC for DGW prep, BB vs TC by xPts, GW38 urgency
-- **FPL Review integration**: Automated CSV download with Telegram notifications
+- **FPL Review integration**: Pi downloads CSV, SCPs to VPS, Telegram notifications
 
 ### How Autonomous Execution Works
 
@@ -197,6 +200,24 @@ pytest tests/ -v --cov=src      # With coverage
 ---
 
 ## Change Log
+
+### Feb 14, 2026 - Session 6: Migrate FPL Review download to Raspberry Pi
+
+- **New `pi/` directory**: Standalone download script for Raspberry Pi
+  - `pi/download_and_upload.py`: Downloads CSV via FPLReviewClient, SCPs to VPS
+  - `pi/fplreview_client.py`: Full Playwright browser automation (copied from src/)
+  - `pi/setup.sh`: One-time setup (venv, Playwright Chromium, SSH key check)
+  - `pi/.env.example`: Template with VPS connection details
+  - File lock (`/tmp/fpl_download.lock`) prevents overlapping cron runs
+  - Telegram notifications on success/failure
+- **VPS simplification**:
+  - `src/fplreview_client.py` → stub (raises NotImplementedError)
+  - `update_projections.py` → removed download logic, kept git commit/push, added freshness check
+  - `src/data_collector.py` → warns if CSV is >24h old (Pi cron health check)
+  - `.env.example` → removed FPL Review credentials (now Pi-only)
+- **Cron schedule** (Pi): 06:00 UTC daily, 08:00 UTC retry, midnight Fri/Sat for deadlines
+- **SSH**: Pi uses `~/.ssh/fpl_pi_to_vps` key to SCP to VPS
+- **Dockerfile unchanged**: Keeps Playwright base image (needed for `fpl_client.py` FPL auth)
 
 ### Feb 13, 2026 - Session 5: FPL Review automation + Twitter/OCR groundwork
 

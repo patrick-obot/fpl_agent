@@ -1,115 +1,40 @@
 #!/usr/bin/env python3
 """
-FPL Projections Updater
+FPL Projections Updater (VPS-side)
 
-Automatically downloads projected_points.csv from FPL Review via Patreon,
-then commits and pushes to git.
+Commits and pushes projected_points.csv that was SCP'd from the Raspberry Pi.
+Checks CSV freshness before committing.
 
 Usage:
-    python update_projections.py [--skip-download] [--skip-commit]
-
-Options:
-    --skip-download  Skip the automatic download (use existing file)
-    --skip-commit    Skip git commit and push (just download)
+    python update_projections.py              # Commit + push
+    python update_projections.py --skip-commit  # Just show file info
 """
 
-import asyncio
 import subprocess
 import sys
 from pathlib import Path
-from datetime import datetime
-
-import aiohttp
-
-# Add src to path for imports
-sys.path.insert(0, str(Path(__file__).parent / "src"))
-
-from config import Config
-from fplreview_client import download_fplreview_projections
+from datetime import datetime, timedelta
 
 
 PROJECT_DIR = Path(__file__).parent
-
-
-async def send_telegram_notification(config: Config, message: str) -> bool:
-    """Send a Telegram notification."""
-    if not config.telegram_bot_token or not config.telegram_chat_id:
-        print("Telegram not configured, skipping notification")
-        return False
-
-    url = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage"
-    payload = {
-        "chat_id": config.telegram_chat_id,
-        "text": message,
-        "parse_mode": "HTML"
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=30) as response:
-                if response.status == 200:
-                    print("Telegram notification sent")
-                    return True
-                else:
-                    print(f"Telegram API error: {response.status}")
-                    return False
-    except Exception as e:
-        print(f"Telegram notification failed: {e}")
-        return False
 DATA_FILE = PROJECT_DIR / "data" / "projected_points.csv"
 
 
-async def download_projections(config: Config) -> bool:
-    """Download projections CSV from FPL Review."""
-    print("Downloading projections from FPL Review...")
-    print()
-
-    if not config.fpl_review_email or not config.fpl_review_password:
-        print("ERROR: FPL_REVIEW_EMAIL and FPL_REVIEW_PASSWORD must be set in .env")
-        print()
-        print("Add the following to your .env file:")
-        print("  FPL_REVIEW_EMAIL=your_patreon_email")
-        print("  FPL_REVIEW_PASSWORD=your_patreon_password")
-        await send_telegram_notification(
-            config,
-            "❌ <b>FPL Review Download Failed</b>\n\nCredentials not configured."
-        )
+def check_freshness() -> bool:
+    """Check if the CSV is reasonably fresh. Warns if stale."""
+    if not DATA_FILE.exists():
+        print(f"ERROR: {DATA_FILE} not found!")
+        print("The Raspberry Pi has not uploaded the CSV yet.")
         return False
 
-    csv_path = await download_fplreview_projections(
-        email=config.fpl_review_email,
-        password=config.fpl_review_password,
-        download_dir=config.data_dir,
-        headless=True,
-        logger=config.logger,
-        team_id=str(config.fpl_team_id),
-    )
+    age = datetime.now() - datetime.fromtimestamp(DATA_FILE.stat().st_mtime)
 
-    if csv_path and csv_path.exists():
-        file_size = csv_path.stat().st_size
-        print(f"Download successful: {csv_path}")
+    if age > timedelta(hours=48):
+        print(f"WARNING: CSV is {age.total_seconds() / 3600:.0f}h old — check if Pi cron is running")
+    elif age > timedelta(hours=24):
+        print(f"INFO: CSV is {age.total_seconds() / 3600:.0f}h old")
 
-        # Send success notification
-        await send_telegram_notification(
-            config,
-            f"✅ <b>FPL Review Projections Downloaded</b>\n\n"
-            f"📁 File: projected_points.csv\n"
-            f"📊 Size: {file_size:,} bytes\n"
-            f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        )
-        return True
-    else:
-        print("ERROR: Download failed!")
-        print("Check the screenshots in data/ folder for debugging.")
-
-        # Send failure notification
-        await send_telegram_notification(
-            config,
-            f"❌ <b>FPL Review Download Failed</b>\n\n"
-            f"Check screenshots in data/ folder.\n"
-            f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        )
-        return False
+    return True
 
 
 def show_file_info():
@@ -183,9 +108,7 @@ def git_commit_and_push() -> bool:
     return True
 
 
-async def main():
-    # Parse command line arguments
-    skip_download = "--skip-download" in sys.argv
+def main():
     skip_commit = "--skip-commit" in sys.argv
 
     print("=" * 60)
@@ -194,17 +117,11 @@ async def main():
     print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
 
-    # Load config
-    config = Config.from_env()
+    # Step 1: Check freshness
+    if not check_freshness():
+        return 1
 
-    # Step 1: Download projections (unless skipped)
-    if not skip_download:
-        success = await download_projections(config)
-        if not success:
-            return 1
-        print()
-
-    # Step 2: Verify file exists and show info
+    # Step 2: Show file info
     if not show_file_info():
         return 1
 
@@ -221,4 +138,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    sys.exit(main())
