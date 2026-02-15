@@ -130,7 +130,7 @@ class FPLReviewClient:
                 # Step 1: Go straight to Free Planner (no Patreon login needed)
                 self.logger.info("Navigating to Free Planner...")
                 await page.goto(self.FREE_PLANNER_URL, wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(3000)
 
                 # Handle cookie consent popup if present
                 await self._accept_cookies(page)
@@ -138,22 +138,28 @@ class FPLReviewClient:
                 # Step 2: Trigger data load (fill Team ID + click Load Page)
                 await self._trigger_data_load(page)
 
-                # Step 3: Verify data is loaded before attempting download
-                data_ready = await self._wait_for_table_data(page, timeout_s=10)
-                if not data_ready:
-                    self.logger.warning("Data not loaded yet, retrying data trigger...")
+                # Step 3: Wait for the Player List table to fully load (50+ rows)
+                # The squad planner table loads first (~9 rows) — we need the big one.
+                player_list_ready = await self._load_player_list_data(page)
+                if not player_list_ready:
+                    self.logger.warning("Player List not fully loaded, trying Load Group again...")
                     await self._trigger_data_load(page)
+                    await self._load_player_list_data(page)
 
-                # Step 6: Try to build CSV from captured network responses
+                # Step 4: Try download button (with blob interception)
+                self.logger.info("Player List loaded, attempting CSV download...")
                 csv_path = self.download_dir / "projected_points.csv"
+                csv_path_result = await self._download_csv(page, context)
+                if csv_path_result:
+                    return csv_path_result
+
+                # Step 5: Try to build CSV from captured network responses
                 result = await self._build_csv_from_network(csv_path)
                 if result:
                     return result
 
-                # Step 7: Fall back to download button + DOM scrape
-                self.logger.info("Network capture didn't find projection data, trying download button...")
-                csv_path = await self._download_csv(page, context)
-                return csv_path
+                self.logger.error("All download methods failed")
+                return None
 
             except Exception as e:
                 self.logger.error(f"Error during download: {e}")
