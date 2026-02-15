@@ -127,34 +127,18 @@ class FPLReviewClient:
             page.on('response', lambda r: asyncio.create_task(_capture_response(r)))
 
             try:
-                # Step 1: Navigate to FPL Review
-                self.logger.info("Navigating to FPL Review...")
-                await page.goto(self.FPLREVIEW_URL, wait_until="domcontentloaded", timeout=30000)
-
-                # Step 2: Try Patreon login (not required for Free Planner)
-                logged_in = await self._login_via_patreon(page)
-                if not logged_in:
-                    self.logger.warning("Patreon login failed - continuing with Free Planner (no login required)")
-
-                # Step 3: Navigate to FPL Review Free Planner
-                self.logger.info("Navigating to FPL Review...")
-                await page.goto(self.FPLREVIEW_URL, wait_until="domcontentloaded", timeout=60000)
+                # Step 1: Go straight to Free Planner (no Patreon login needed)
+                self.logger.info("Navigating to Free Planner...")
+                await page.goto(self.FREE_PLANNER_URL, wait_until="domcontentloaded", timeout=60000)
                 await page.wait_for_timeout(2000)
 
                 # Handle cookie consent popup if present
                 await self._accept_cookies(page)
 
-                # Step 4: Navigate to the planner via menu
-                await self._navigate_to_planner(page)
+                # Step 2: Trigger data load (fill Team ID + click Load Page)
+                await self._trigger_data_load(page)
 
-                # Step 5: Check if we need to reconnect Patreon (only if logged in)
-                if logged_in:
-                    reconnected = await self._handle_fplreview_reconnect(page)
-                    if reconnected:
-                        # Navigate back to planner after reconnect
-                        await self._navigate_to_planner(page)
-
-                # Step 5.5: Verify data is loaded before attempting download
+                # Step 3: Verify data is loaded before attempting download
                 data_ready = await self._wait_for_table_data(page, timeout_s=10)
                 if not data_ready:
                     self.logger.warning("Data not loaded yet, retrying data trigger...")
